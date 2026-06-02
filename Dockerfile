@@ -8,7 +8,7 @@ WORKDIR /home/user/pilot_trader
 
 RUN pip install --no-cache-dir dash plotly pandas yfinance
 
-COPY dashboard.py ./
+COPY dashboard.py resolver.py ./
 
 EXPOSE 8051
 
