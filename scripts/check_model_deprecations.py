@@ -16,6 +16,7 @@ of its announced shutdown date, or already past it.
 Requires no notification credentials. Output goes to stdout/stderr.
 """
 import argparse
+import os
 import re
 import sys
 import traceback
@@ -23,7 +24,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-sys.path.insert(0, "/home/user/pilot_trader")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import monitor
 import youtube_monitor
 import twitter_digest

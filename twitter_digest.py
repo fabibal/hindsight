@@ -115,7 +115,7 @@ from monitor import (load_env, ENV_FILE,
                      GeminiTally, report_gemini_outage)
 
 # --- config ---------------------------------------------------------------
-HOME = "/home/user/pilot_trader"
+HOME = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HOME, "data")
 
 # Every Gemini call this run, across all feeds. Each helper below swallows its

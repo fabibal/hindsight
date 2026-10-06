@@ -6,7 +6,7 @@ services:
     image: pilot-trader-dashboard:latest
     container_name: pilot_trader_dashboard
     restart: unless-stopped
-    # Match user, who owns the atomically written mode-0600 data files.
+    # Match the host user, who owns the atomically written mode-0600 data files.
     # Root with all capabilities dropped cannot bypass their permissions.
     user: "1000:1000"
 
@@ -32,13 +32,13 @@ services:
       # Bind-mount the host project so trades.json / monitor.py / dashboard.py
       # are live inside the container at the path the app expects.
       # Read-only: a dashboard compromise must not rewrite source or ledgers.
-      - .:/home/user/pilot_trader:ro
+      - .:/app:ro
       # The one writable path: the dashboard's own derived cache (immutable
       # past closes, GetXAPI balance snapshots) -- never source or ledgers.
       # Without it the persisted price cache silently stopped updating.
-      - ./data/cache:/home/user/pilot_trader/data/cache
+      - ./data/cache:/app/data/cache
       # Hide unneeded API secrets in the host .env from the dashboard.
-      - /dev/null:/home/user/pilot_trader/.env:ro
+      - /dev/null:/app/.env:ro
       # No Docker socket: status stats gracefully report unavailable.
 
     cap_drop:

@@ -25,7 +25,7 @@ Run modes:
 
 Requires GOOGLE_API_KEY + the source's key (GETXAPI_KEY or X_BEARER_TOKEN),
 loaded from ~/pilot_trader/.env. Run with the project venv:
-/home/user/pilot_trader/.venv/bin/python monitor.py
+.venv/bin/python monitor.py
 """
 
 import argparse
@@ -61,7 +61,7 @@ from llm_support import parse_response, token_usage
 # Account identity/classification config is shared across the pipeline and
 # lives in accounts.py (single source of truth).
 from accounts import ACCOUNTS, SOURCE_TYPE, POSTS_ONLY_ACCOUNTS
-HOME = "/home/user/pilot_trader"
+HOME = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HOME, "data")
 COST_LOG_FILE = os.path.join(DATA_DIR, "cost_log.json")
 TRADES_FILE = os.path.join(HOME, "trades.json")

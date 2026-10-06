@@ -38,7 +38,7 @@ from storage import single_writer
 # disagreed with dashboard.py.
 from accounts import ACCOUNT_DEFAULT_PF, NON_AI_ACCOUNTS
 
-HOME = "/home/user/pilot_trader"
+HOME = os.path.dirname(os.path.abspath(__file__))
 TRADES_FILE = os.path.join(HOME, "trades.json")
 POSITIONS_FILE = os.path.join(HOME, "positions.json")
 # Signals at this confidence are logged to trades.json but must NOT move

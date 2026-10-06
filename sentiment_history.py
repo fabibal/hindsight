@@ -30,7 +30,7 @@ import os
 from reconcile import write_json_atomic
 from storage import load_ledger, ledger_lock
 
-HOME = "/home/user/pilot_trader"
+HOME = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HOME, "data")
 HISTORY_FILE = os.path.join(DATA_DIR, "sentiment_history.json")
 

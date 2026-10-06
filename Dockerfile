@@ -1,10 +1,10 @@
 # Simple image for the pilot_trader Dash dashboard.
-# The app reads /home/user/pilot_trader/trades.json (absolute path), so the
-# host project dir is bind-mounted at that same path at runtime; the COPY below
-# only provides a fallback if the volume is absent.
+# The app resolves its data paths relative to dashboard.py, so the host project
+# dir is bind-mounted over /app at runtime; the COPY below only provides a
+# fallback if the volume is absent.
 FROM python:3.12-slim
 
-WORKDIR /home/user/pilot_trader
+WORKDIR /app
 
 COPY requirements-dashboard.txt ./
 RUN pip install --no-cache-dir -r requirements-dashboard.txt

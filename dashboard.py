@@ -17,7 +17,7 @@ background.
 
 Served on port 8051 (host exposure controlled in docker-compose.yml).
 Run with the project venv:
-    /home/user/pilot_trader/.venv/bin/python dashboard.py
+    .venv/bin/python dashboard.py
 """
 
 import glob
@@ -42,11 +42,11 @@ import resolver
 import evaluation
 from signal_semantics import is_junk_ticker, normalize_event
 
-HOME = "/home/user/pilot_trader"
-TRADES_FILE = "/home/user/pilot_trader/trades.json"
-POSITIONS_FILE = "/home/user/pilot_trader/positions.json"
-STATE_FILE = "/home/user/pilot_trader/.monitor_state.json"
-ENV_FILE = "/home/user/pilot_trader/.env"
+HOME = os.path.dirname(os.path.abspath(__file__))
+TRADES_FILE = os.path.join(HOME, "trades.json")
+POSITIONS_FILE = os.path.join(HOME, "positions.json")
+STATE_FILE = os.path.join(HOME, ".monitor_state.json")
+ENV_FILE = os.path.join(HOME, ".env")
 STALE_HOURS = 8           # cron runs every 4h; >8h means a run was missed
 REFRESH_MS = 60_000
 PORT = 8051
@@ -97,7 +97,7 @@ CREDITS_REFRESH_MS = 3_600_000   # 60 min — don't hammer the credits API
 CREDITS_LOW_USD = 1.00           # below this, show the balance in red
 
 # LLM spend telemetry written per run by monitor.log_cost().
-COST_LOG_FILE = "/home/user/pilot_trader/data/cost_log.json"
+COST_LOG_FILE = os.path.join(HOME, "data", "cost_log.json")
 
 
 def _load_env(path):
@@ -122,7 +122,7 @@ _credits_cache = {"balance": None, "fetched_at": None, "ok": False}
 
 # Balance snapshots [(epoch, balance)] -> credits_days_left(). Kept 14 days in
 # the writable cache dir so a restart doesn't reset the burn-rate window.
-CREDITS_HISTORY_FILE = "/home/user/pilot_trader/data/cache/getxapi_credits.json"
+CREDITS_HISTORY_FILE = os.path.join(HOME, "data", "cache", "getxapi_credits.json")
 CREDITS_HISTORY_DAYS = 14
 
 
@@ -260,7 +260,7 @@ _fetch_state = {"last": None}   # epoch of the most recent live Yahoo fetch
 # they are persisted to disk and never re-fetched. Keyed "TICKER|YYYY-MM-DD".
 # data/cache is the one writable mount in the otherwise read-only container
 # (docker-compose.yml): it holds only this derived cache, never ledgers.
-DATA_DIR = "/home/user/pilot_trader/data"
+DATA_DIR = os.path.join(HOME, "data")
 CACHE_DIR = os.path.join(DATA_DIR, "cache")
 PRICE_CACHE_FILE = os.path.join(CACHE_DIR, "price_cache.json")
 
