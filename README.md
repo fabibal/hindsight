@@ -207,6 +207,33 @@ Further write-ups: the [copy-trading review](docs/copy_trading_review_2026-10-02
 [model review](docs/model_review_2026-09-30.md) (why the current Gemini models
 were kept after side-by-side tests on real inputs).
 
+## What I learned
+
+The short version, with the evidence in [`docs/`](docs/):
+
+- Claimed track records do not survive resolution against real prices. Some
+  "calls" had a target or stop already past the entry when posted, and recaps of
+  old trades look like fresh signals until the extraction is grounded in the
+  post's own text and trade date.
+- Letting a model say "I don't know" matters more than squeezing out more
+  signals: ambiguous records stay in review, and a chart alone never becomes a
+  confirmed holding.
+- A pipeline that swallows API errors can fail silently for days. Run-wide
+  failure tallies and a durable input queue (commit output, then acknowledge
+  input) turned that into a loud, recoverable failure.
+- Model choice is an empirical question. Re-running real inputs side by side
+  showed a newer, cheaper model was also more reliable, and handing a video URL
+  to the model directly used far fewer tokens than reading a transcript.
+- Cost tracks post volume, not content type; deduplication and pre-LLM gating
+  did most of the work of keeping spend small.
+
+## Repo notes
+
+- `docs/` holds dated audits and reviews of the pipeline; `docs/decision_details_2026-09-08.md`
+  explains why strategy mining and outbound notifications were retired.
+- Runtime data, logs and the local ops runbook are git-ignored. The monitored
+  accounts' posts are public content and are not redistributed here.
+
 ## Security & contributing
 
 > ⚠️ **This is a public repository — never commit sensitive data.**
@@ -233,6 +260,10 @@ Guidelines:
   it as compromised: rotate it immediately and scrub it from git history.
 
 ---
+
+## License
+
+MIT, see [LICENSE](LICENSE).
 
 ## Disclaimer
 

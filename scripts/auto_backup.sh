@@ -11,12 +11,17 @@ ts() { date -u '+%Y-%m-%d %H:%M:%S UTC'; }
 cd "${REPO}" || { echo "$(ts) ERROR: cannot cd to ${REPO}"; exit 1; }
 echo "===== $(ts) auto-backup start ====="
 
-git add -A || { echo "$(ts) ERROR: git add failed"; exit 1; }
+# Public repo: stage only modifications/deletions of already-tracked files.
+# New files need a manual review + `git add`, so nothing unreviewed ships.
+git add -u || { echo "$(ts) ERROR: git add failed"; exit 1; }
+untracked=$(git ls-files --others --exclude-standard)
+[ -n "${untracked}" ] && echo "$(ts) WARN: untracked, not backed up: ${untracked//$'\n'/ }"
 
-if git diff --quiet HEAD; then
+if git diff --cached --quiet; then
     echo "$(ts) no working-tree changes to commit"
 else
-    if git commit -m "Auto-backup $(date -u '+%Y-%m-%d %H:%M UTC')"; then
+    if git -c user.name='Balazs' -c user.email='fabibal@users.noreply.github.com' \
+        commit -m "Auto-backup $(date -u '+%Y-%m-%d %H:%M UTC')"; then
         echo "$(ts) committed local changes"
     else
         echo "$(ts) ERROR: git commit failed"
