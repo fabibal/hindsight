@@ -1,4 +1,4 @@
-# Pilot Trader
+# Hindsight
 
 **An LLM-driven trade-call tracker and market-research aggregator.** It watches
 finance influencers on X (Twitter), uses large language models to extract
