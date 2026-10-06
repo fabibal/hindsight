@@ -2,7 +2,7 @@
 # Daily GitHub auto-backup for pilot_trader. Logs success AND errors (never
 # fails silently). Installed in the host crontab as:
 #   30 3 * * * /home/user/pilot_trader/scripts/auto_backup.sh >> /home/user/pilot_trader/auto_backup.log 2>&1
-# SSH auth: git@github.com -> ~/.ssh/deploy-key (via ~/.ssh/config).
+# SSH auth: git@github.com via a dedicated key configured in ~/.ssh/config.
 
 set -u
 REPO="${HOME}/pilot_trader"
