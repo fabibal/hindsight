@@ -1087,13 +1087,13 @@ def _tweet_page(data):
     return batch
 
 
-def fetch_getxapi(account, since_id=None):
-    """Cursor-paginate the bounded overlap window; pinned/known posts do not stop it. Returns (tweets, n_api_calls)."""
+def fetch_getxapi(account, since_id=None, max_pages=None):
+    """Cursor-paginate the bounded overlap window; pinned/known posts do not stop it. max_pages caps the calls (quick runs). Returns (tweets, n_api_calls)."""
     collected, cursor, calls = [], None, 0
     cursors = set()
     path = (GETXAPI_POSTS_PATH if account in POSTS_ONLY_ACCOUNTS
             else GETXAPI_TWEETS_PATH)
-    while len(collected) < MAX_FETCH:
+    while len(collected) < MAX_FETCH and (max_pages is None or calls < max_pages):
         params = {"userName": account}
         if cursor:
             params["cursor"] = cursor
@@ -1117,7 +1117,7 @@ def fetch_getxapi(account, since_id=None):
     return collected, calls
 
 
-def tweets_for_account(account, state, backfill, source):
+def tweets_for_account(account, state, backfill, source, quick=False):
     """Return (tweets, twitter_reads, api_calls). Backfill reads local snapshots."""
     if backfill:
         snapshot = RAW_FILES.get(account)
@@ -1126,7 +1126,8 @@ def tweets_for_account(account, state, backfill, source):
         return load_ledger(snapshot, []), 0, 0
     since_id = state.get(account, {}).get("newest_id")
     if source == "getxapi":
-        tweets, calls = fetch_getxapi(account, since_id=since_id)
+        tweets, calls = fetch_getxapi(account, since_id=since_id,
+                                       max_pages=1 if quick else None)
     else:
         uid = api_get(f"{API_BASE}/users/by/username/{account}")["data"]["id"]
         tweets = fetch_tweets(uid, since_id=since_id)
@@ -1153,6 +1154,9 @@ def main():
     ap.add_argument("--source", choices=["official", "getxapi"], default="getxapi",
                     help="tweet backend: getxapi (default, tweets_and_replies) "
                          "or official X API")
+    ap.add_argument("--quick", action="store_true",
+                    help="getxapi: fetch only the newest page per account (the "
+                         "full overlap window is for the scheduled full scans)")
     ap.add_argument("--dry-run", action="store_true",
                     help="fetch fresh + analyze, but write NOTHING (no trades.json, "
                          "positions.json, or state). Dumps would-be signals to "
@@ -1223,7 +1227,7 @@ def main():
         attempted += 1
         try:
             tweets, reads, calls = tweets_for_account(
-                account, run_state, args.backfill, args.source)
+                account, run_state, args.backfill, args.source, args.quick)
         except urllib.error.HTTPError as e:
             print(f"[{account}] HTTP {e.code}: "
                   f"{e.read().decode('utf-8', 'replace')}", file=sys.stderr)

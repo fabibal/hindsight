@@ -326,3 +326,14 @@ def test_html_entities_and_corruption_detectors():
     assert monitor._unescape_strings({'text': 't&aacute;masz'}) == {'text': 'támasz'}
     for text in ['vesztes)g', 'n\x01gy', 'realiz\'alt', 'T#1;masz', 'mozg\ttlagot', 'v rakoz', '%141ll%141spontja']:
         assert monitor._looks_mangled(text)
+
+
+def test_fetch_getxapi_max_pages_limits_calls(monkeypatch):
+    pages = iter([{'tweets': [{'id': '3', 'createdAt': 'Wed Sep 02 00:00:00 +0000 2026'}], 'has_more': True, 'next_cursor': 'a'},
+                  {'tweets': [{'id': '2', 'createdAt': 'Wed Sep 02 00:00:00 +0000 2026'}], 'has_more': True, 'next_cursor': 'b'},
+                  {'tweets': [{'id': '1', 'createdAt': 'Wed Sep 02 00:00:00 +0000 2026'}], 'has_more': False}])
+    monkeypatch.setattr(monitor, 'getxapi_get_retry', lambda _: next(pages))
+    raw, calls = monitor.fetch_getxapi('IncomeSharks', max_pages=1)
+    assert calls == 1 and [x['id'] for x in raw] == ['3']
+    raw, calls = monitor.fetch_getxapi('IncomeSharks')
+    assert calls == 2 and [x['id'] for x in raw] == ['2', '1']
