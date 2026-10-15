@@ -9,37 +9,66 @@ services:
     # Match the host user, who owns the atomically written mode-0600 data files.
     # Root with all capabilities dropped cannot bypass their permissions.
     user: "1000:1000"
+    init: true
 
-    # Host networking: originally REQUIRED for the IBKR Paper Portfolio tab (IB
-    # Gateway only trusts loopback, so a bridge-networked container's different
-    # source IP was rejected). That integration was retired 2026-08-27 (see
-    # CLAUDE.md "IBKR mirror (retired)") — this dashboard no longer talks to IB
-    # Gateway at all, so host mode is no longer strictly required. Left as-is
-    # rather than switching to bridge + `ports:`, since that also means
-    # re-plumbing the NPM/ufw setup documented in CLAUDE.md; revisit if anyone
-    # wants to simplify it deliberately. `ports:` stays incompatible with host
-    # mode (and unnecessary): dashboard.py binds 0.0.0.0:8051 directly on the
-    # host, so it's still reachable at e.g. <LAN_IP>:8051.
-    network_mode: host
+    # Own bridge (br-pilot, 172.30.250.0/24) shared ONLY with nginx-proxy-manager,
+    # which reaches the dashboard as pilot_trader_dashboard:8051. Nothing is
+    # published on the host (no `ports:`). Since 2026-10-14; before that the
+    # container ran with network_mode: host (an IBKR leftover) and could reach every
+    # loopback-only dashboard. Firewall isolation of this bridge (no access to the
+    # host, LAN, router or other Docker networks; internet only) lives outside this
+    # repo: /usr/local/sbin/pilot-isolation.sh + pilot-isolation.service (chain
+    # PILOT-ISOLATION in DOCKER-USER) and the UFW rule "deny in on br-pilot".
+    networks:
+      - pilot_net
+    # Public resolvers: a router/loopback resolver would be inside the blocked ranges.
+    dns:
+      - 1.1.1.1
+      - 9.9.9.9
 
     environment:
       - TZ=UTC
       - PYTHONUNBUFFERED=1
+      # Read-only root filesystem: yfinance's cache dir resolves under HOME.
+      - HOME=/tmp
+      # gunicorn does not run dashboard.py's __main__, so ask for the price-cache warmer.
+      - PILOT_START_WARMER=1
       # Compose reads this one credential from .env; the app needs only credits.
       - GETXAPI_KEY=${GETXAPI_KEY:-}
 
     volumes:
-      # Bind-mount the host project so trades.json / monitor.py / dashboard.py
-      # are live inside the container at the path the app expects.
+      # Bind-mount the host project so trades.json / positions.json / data/ are live
+      # inside the container at the path the app expects (atomic replaces by the
+      # cron pipeline must stay visible, so a directory mount, not single files).
       # Read-only: a dashboard compromise must not rewrite source or ledgers.
       - .:/app:ro
       # The one writable path: the dashboard's own derived cache (immutable
       # past closes, GetXAPI balance snapshots) -- never source or ledgers.
-      # Without it the persisted price cache silently stopped updating.
       - ./data/cache:/app/data/cache
-      # Hide unneeded API secrets in the host .env from the dashboard.
+      # Hide what the dashboard does not need: API secrets, logs, tweet snapshots.
       - /dev/null:/app/.env:ro
-      # No Docker socket: status stats gracefully report unavailable.
+      - /dev/null:/app/monitor.log:ro
+      - /dev/null:/app/twitter_digest.log:ro
+      - /dev/null:/app/youtube_monitor.log:ro
+      - /dev/null:/app/reconcile.log:ro
+      - /dev/null:/app/auto_backup.log:ro
+      - /dev/null:/app/check_model_deprecations.log:ro
+      - /dev/null:/app/tweets_incomesharks.json:ro
+      - /dev/null:/app/tweets_traderstewie.json:ro
+      # No Docker socket.
+
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+      # Empty, read-only views over directories the dashboard never reads.
+      - /app/.git:ro,size=4k
+      - /app/.venv:ro,size=4k
+      - /app/.claude:ro,size=4k
+      - /app/.code-review-graph:ro,size=4k
+      - /app/logs:ro,size=4k
+      - /app/results:ro,size=4k
+      - /app/docs:ro,size=4k
+      - /app/tests:ro,size=4k
 
     cap_drop:
       - ALL
@@ -50,12 +79,8 @@ services:
       resources:
         limits:
           cpus: "0.5"
-          # 512M (was 384M): originally ib_insync + an IB API connection per
-          # refresh + the background price-cache warmer; 384M ran ~91% full
-          # (OOM risk). The IBKR piece is gone (2026-08-27), but left at 512M
-          # rather than reverting unmeasured — the price-cache warmer alone
-          # was never isolated from the old figure.
           memory: 512M
+          pids: 128
 
     logging:
       driver: "json-file"
@@ -71,3 +96,13 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+
+networks:
+  pilot_net:
+    name: pilot_net
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-pilot
+    ipam:
+      config:
+        - subnet: 172.30.250.0/24

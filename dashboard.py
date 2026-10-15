@@ -3381,10 +3381,32 @@ def _warm_loop():
         time.sleep(WARM_INTERVAL_S)
 
 
-if __name__ == "__main__":
-    # Pre-warm price/series/OHLC caches in the background so page loads don't
-    # block on ~30s of Yahoo round-trips (see _warm_loop above).
+# WSGI entry point for gunicorn (`gunicorn dashboard:server`, docker-compose).
+server = app.server
+
+_bg_lock = threading.Lock()
+_bg_started = False
+
+
+def start_background():
+    """Pre-warm price/series/OHLC caches in the background so page loads don't
+    block on ~30s of Yahoo round-trips (see _warm_loop above). Idempotent; the
+    caches are per-process, so run ONE gunicorn worker (threads, not workers)."""
+    global _bg_started
+    with _bg_lock:
+        if _bg_started:
+            return
+        _bg_started = True
     threading.Thread(target=_warm_loop, daemon=True, name="cache-warmer").start()
-    # Bind 0.0.0.0 INSIDE the container so Docker's port proxy can reach it;
-    # host exposure is set by the publish mapping in docker-compose.yml.
+
+
+# Under gunicorn nothing runs __main__; compose sets this. Unset in tests, so
+# importing the module starts no thread.
+if os.environ.get("PILOT_START_WARMER") == "1":
+    start_background()
+
+
+if __name__ == "__main__":
+    start_background()
+    # Dev server only (python dashboard.py); the container runs gunicorn.
     app.run(host="0.0.0.0", port=PORT, debug=False)
