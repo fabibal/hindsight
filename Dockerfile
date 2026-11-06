@@ -10,9 +10,9 @@ COPY requirements-dashboard.txt ./
 RUN pip install --no-cache-dir -r requirements-dashboard.txt
 
 # Bind-mount overlays these at runtime, so the COPYs are a fallback only. The
-# Dashboard imports only resolver and the shared account registry; Dash serves
-# assets/ (the "ÚJ" badge script) itself.
-COPY dashboard.py resolver.py accounts.py evaluation.py signal_semantics.py ./
+# dashboard is a single module; Dash serves assets/ (the "ÚJ" badge script)
+# itself.
+COPY dashboard.py ./
 COPY assets ./assets
 
 ENV PYTHONDONTWRITEBYTECODE=1

@@ -110,13 +110,12 @@ def test_makeitcount_callback_renders_chapters_and_frames(monkeypatch):
     record['important_frames'][0]['image_file'] = 'vVzpvE2Wr3Q_20.jpg'
     monkeypatch.setattr(dash, 'load_makeitcount_summaries', lambda: [record])
     with dash.app.server.test_client() as client:
-        key = next(k for k in dash.app.callback_map if 'influencer-signals.data' in k)
+        key = next(k for k in dash.app.callback_map if 'makeitcount-summaries.children' in k)
         outputs = [dict(zip(['id','property'], part.rsplit('.',1))) for part in key[2:-2].split('...')]
         response = client.post('/_dash-update-component', json=dict(
             output=key, outputs=outputs, inputs=[
                 dict(id='data-version', property='data', value='test'),
-                dict(id='influencer-subtabs', property='value', value='MakeItCount'),
-                dict(id='signals-commentary', property='value', value=[])],
+                dict(id='influencer-subtabs', property='value', value='MakeItCount')],
             state=[], changedPropIds=['influencer-subtabs.value']))
     assert response.status_code == 200
     content = response.get_json()['response']['makeitcount-summaries']['children']

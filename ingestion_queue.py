@@ -5,7 +5,7 @@ silently discard an uncommitted input. Dry runs never change queue state.
 """
 import os
 from storage import load_ledger
-from reconcile import write_json_atomic
+from storage import write_json_atomic
 
 
 class PendingInputs:

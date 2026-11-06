@@ -5,6 +5,7 @@ from functools import wraps
 import fcntl
 import json
 import os
+import tempfile
 
 
 def load_ledger(path, default, *, records=True):
@@ -46,3 +47,19 @@ def single_writer(path_for_call):
                 return func(*args, **kwargs)
         return wrapped
     return decorate
+
+
+def write_json_atomic(path, data):
+    """Write JSON via temp file + os.replace so a crash can't corrupt the file."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise

@@ -1,88 +1,40 @@
-#!/usr/bin/env python3
-"""
-Multi-account trade-signal monitor for X trade-call accounts, with LLM
-interpretation.
+"""Shared helpers for the X / YouTube analysis digests (twitter_digest.py, youtube_monitor.py).
 
-Pipeline per tweet:
-  1. Every tweet (including @-replies — sells are often disclosed there) is
-     sent to Gemini (gemini-2.5-flash-lite) which extracts ticker / action /
-     size / entry price / trade date / portfolio / confidence as
-     schema-constrained JSON (always valid).
-  2. Signals with action == "none" or a null ticker are discarded.
-  3. Kept signals are tagged with their source account, written to
-     ~/pilot_trader/trades.json (deduped by tweet id), then reconciled into
-     ~/pilot_trader/positions.json.
-
-Tweet backend (--source): defaults to GetXAPI via its tweets_and_replies
-endpoint (cheap, untruncated text, and INCLUDES @-replies so reply-disclosed
-sells are not missed). --source official uses the X API v2 instead.
-
-Run modes:
-  python monitor.py                 # GetXAPI (default), fetch + interpret
-  python monitor.py --source official
-  python monitor.py --backfill      # re-interpret local snapshots (no fetch)
-  python monitor.py --dry-run       # fetch + analyze, write nothing
-
-Requires GOOGLE_API_KEY + the source's key (GETXAPI_KEY or X_BEARER_TOKEN),
-loaded from ~/pilot_trader/.env. Run with the project venv:
-.venv/bin/python monitor.py
+GetXAPI fetch + normalisation, Gemini model / price constants, the Hungarian
+mangled-text detector and the LLM-outage tally. The trade-signal monitor that
+used to live in this module (IncomeSharks / traderstewie extraction, positions,
+IBKR-era plumbing) was removed on 2026-11-06; see git history before that date.
+The file name is kept so the digests' `import monitor` lines stay unchanged.
 """
 
-import argparse
 import gzip
 import html
-import http.client
 import json
 import os
 import re
 import sys
-import time
-import traceback
-import copy
-import hashlib
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from signal_semantics import normalize_event, quote_in_text, EVENT_KINDS, is_junk_ticker
 from email.utils import parsedate_to_datetime
-
-from google import genai
 from google.genai import types as genai_types
-from google.genai import errors as genai_errors
 
-import cost_log
-from reconcile import reconcile, write_json_atomic
-from storage import load_ledger, single_writer
-from llm_support import parse_response, token_usage
 
-# --- config ---------------------------------------------------------------
-# X bearer token is loaded from .env (X_BEARER_TOKEN) — never hardcoded.
-# Account identity/classification config is shared across the pipeline and
-# lives in accounts.py (single source of truth).
-from accounts import ACCOUNTS, SOURCE_TYPE, POSTS_ONLY_ACCOUNTS
 HOME = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(HOME, "data")
-COST_LOG_FILE = os.path.join(DATA_DIR, "cost_log.json")
-TRADES_FILE = os.path.join(HOME, "trades.json")
-POSITIONS_FILE = os.path.join(HOME, "positions.json")
-STATE_FILE = os.path.join(HOME, ".monitor_state.json")
+
+
 ENV_FILE = os.path.join(HOME, ".env")
-MONITOR_LOG = os.path.join(HOME, "monitor.log")
-STALE_WARN_HOURS = 8        # alert if the last successful run is older than this
-RAW_FILES = {  # used by --backfill; accounts without a snapshot are skipped
-    "IncomeSharks": os.path.join(HOME, "tweets_incomesharks.json"),
-    "traderstewie": os.path.join(HOME, "tweets_traderstewie.json"),
-}
-MAX_FETCH = 100
-API_BASE = "https://api.twitter.com/2"
+
+
 GETXAPI_BASE = "https://api.getxapi.com"
-# tweets_and_replies (NOT the posts-only "tweets" endpoint) so sell signals
-# disclosed in @-replies are included. POSTS_ONLY_ACCOUNTS use the "tweets"
-# (Posts tab) endpoint instead, which excludes @-replies entirely.
-GETXAPI_TWEETS_PATH = "/twitter/user/tweets_and_replies"
+
+
 GETXAPI_POSTS_PATH = "/twitter/user/tweets"
+
+
 GETXAPI_COST_PER_CALL = 0.001        # $/call (~20 tweets/page)
+
 
 # Text extraction. gemini-2.5-flash-lite replaced Haiku here 2026-07 (Anthropic
 # credit balance depleted): cheap, stable (not the shut-down preview variant),
@@ -94,10 +46,16 @@ GETXAPI_COST_PER_CALL = 0.001        # $/call (~20 tweets/page)
 # thinking_budget=0 is explicit even though 2.5 Flash-Lite defaults to thinking
 # off, so a future Google default change can't silently eat max_output_tokens.
 MODEL = "gemini-2.5-flash-lite"
+
+
 EXTRACT_THINKING = genai_types.ThinkingConfig(thinking_budget=0)
-TWITTER_COST_PER_TWEET = 0.005       # X API read
+
+
 EXTRACT_INPUT_PER_1M = 0.10          # $ / 1M input tokens
+
+
 EXTRACT_OUTPUT_PER_1M = 0.40         # $ / 1M output tokens
+
 
 # Vision model for chart-image analysis (Haiku 4.5 does NOT accept images).
 # Only used for influencer tweets that carry a chart photo. Pricier per token,
@@ -115,231 +73,25 @@ EXTRACT_OUTPUT_PER_1M = 0.40         # $ / 1M output tokens
 # moved in the same commit — the two share the price constants below, so they
 # have to stay on the same model or the cost logs go wrong.
 VISION_MODEL = "gemini-3.7-flash"
+
+
 GEMINI_THINKING = genai_types.ThinkingConfig(thinking_budget=0)     # off
+
+
 # Opt-in dynamic thinking for the dense, low-volume analysis reads where the
 # reasoning pays off (YouTube/Cowen TA, Kendrick forecasts) — NOT vision, NOT the
 # high-volume per-tweet feeds (ki/joao). Callers that use it MUST give
 # max_output_tokens room for thinking + JSON or the json output truncates.
 GEMINI_DEEP_THINKING = genai_types.ThinkingConfig(thinking_budget=-1)   # dynamic
+
+
 GEMINI_INPUT_PER_1M = 0.75           # $ / 1M input tokens (gemini-3.7-flash)
+
+
 GEMINI_OUTPUT_PER_1M = 3.75          # $ / 1M output tokens, incl. thinking tokens
+
+
 MAX_VISION_IMAGES = 2                # cap images/tweet to bound vision cost
-
-# --- LLM extraction --------------------------------------------------------
-# No pre-filter: every tweet is sent to Claude, which decides what is a signal.
-EXTRACTION_SYSTEM = (
-    "You extract trade signals from tweets posted by trading accounts. Given one "
-    "tweet (and the handle that posted it), decide whether it reports an "
-    "actionable trade (or a currently-held position) and extract the details.\n"
-    "Every monitored account is a HUMAN TRADER / INFLUENCER — currently "
-    "@IncomeSharks and @traderstewie. They post FREQUENT trade ideas/calls on "
-    "stocks and/or crypto, and mix pure analysis/opinion with actionable calls. "
-    "They often state entry prices, stop losses, and price targets. "
-    "@traderstewie is a US STOCK/ETF swing trader (e.g. SOXL, AEHR, LWLG, INTC, "
-    "RKLB) — set asset_type = \"stock\" for its calls. Always set "
-    "portfolio = null (no monitored account posts on behalf of a named model "
-    "portfolio).\n"
-    "OWN VIEW ONLY: extract a signal only when the ACCOUNT HOLDER is stating "
-    "THEIR OWN trade or stance. If the tweet is reacting to, quoting, "
-    "questioning, or disagreeing with SOMEONE ELSE'S call or price prediction "
-    "(e.g. 'I hope we don't see $1400', 'they say it goes to X', replying to "
-    "another user's forecast), that is NOT the account's own signal: set "
-    "action = \"none\". A price someone else predicted is never a target or "
-    "stop for the account.\n"
-    "Rules:\n"
-    "- action: \"buy\" if the account bought/initiated/added OR (for an "
-    "influencer) is calling a long entry / saying it is buying or holding long; "
-    "\"sell\" if it sold/trimmed/exited/dumped OR is calling a short/exit; "
-    "\"position\" if it discloses a current holding or weight without a fresh "
-    "transaction; \"none\" for pure market commentary, opinion, analysis, "
-    "questions, or replies about other people's trades that are NOT an "
-    "actionable own trade/call.\n"
-    "- side: long or short, the direction of the actual holding/setup. "
-    "Covering a short is side short, position_action close/reduce.\n"
-    "- position_action: open, add, reduce, close, or hold. Short entries are "
-    "open/add, never a long exit.\n"
-    "- entry_status: confirmed only for an explicitly executed entry or actual "
-    "current holding/exit. Conditional calls, watching, prospective targets, "
-    "and recommendations without an actual entry are setup.\n"
-    "- sell_kind: only when action is \"sell\". \"full\" if the WHOLE position "
-    "was exited/closed/dumped/sold out. \"partial\" if it was only reduced "
-    "(\"trimmed\", \"reduced\", \"scaled out\", \"took partial/some profits\", "
-    "\"sold half\", \"lightened\"). null when action is not \"sell\" or the "
-    "extent is unclear (treat unclear as full only if the wording clearly means "
-    "a complete exit, else partial).\n"
-    "- ticker: the ticker symbol. For stocks resolve company names to US tickers "
-    "(Broadcom->AVGO, ServiceNow->NOW, Micron->MU, etc.). For crypto use the "
-    "common symbol (Bitcoin->BTC, Ethereum->ETH, Solana->SOL). null if no "
-    "specific asset is the subject.\n"
-    "- asset_type: \"stock\" for equities/ETFs, \"crypto\" for cryptocurrencies, "
-    "\"unknown\" if unclear.\n"
-    "- size_pct: position size as a percent of the portfolio/book if stated "
-    "(e.g. 8.46), as a number BETWEEN 0 AND 100. It must be an explicit "
-    "percentage (a \"%\" sign or wording like \"X% of the book/portfolio\"). "
-    "Do NOT use gain/return percentages. NEVER put a dollar allocation here: "
-    "\"took our $50,000 and bought $PGY\" or \"deployed $5k into NVDA\" states "
-    "DOLLARS, not a percent, so size_pct = null. null if absent.\n"
-    "- entry_price: the PER-SHARE buy/entry price in dollars as a number, only "
-    "if stated as an entry/purchase price per share (not a current price, and "
-    "NOT a total dollar amount deployed — \"bought $50,000 of PGY\" is a total "
-    "spend, not an entry price, so entry_price = null). null if absent.\n"
-    "- stop_loss: the stop-loss price in dollars as a number if stated. null if absent.\n"
-    "- target: the price target / take-profit in dollars as a number if stated. "
-    "null if absent.\n"
-    "- For crypto price levels, ALWAYS output full dollar values. If the tweet "
-    "uses shorthand like \"54-50\" or \"144K\", convert to full numbers (54000, "
-    "50000, 144000). NEVER output a stop_loss or target below 1000 for BTC, ETH, "
-    "or other major crypto.\n"
-    "- trade_date: the actual date the trade was made, as ISO YYYY-MM-DD, if the "
-    "tweet states or implies one (e.g. 'I bought it April 7' => 2026-04-07; "
-    "'bought in early April' => 2026-04-05; 'since May 4th' => 2026-05-04). This "
-    "is the TRANSACTION date and is often EARLIER than the tweet date — resolve "
-    "relative phrases against the tweet date given below and use its year. null "
-    "if no trade date is stated or implied.\n"
-    "- confidence: how confident you are this is a real actionable trade signal "
-    "(\"high\", \"medium\", \"low\", or \"none\").\n"
-    "- portfolio: always null — no monitored account posts on behalf of a "
-    "named model portfolio.\n"
-    "- holding_thesis: for a buy or position, ONE short sentence stating WHY "
-    "the account likes/holds the asset (the bull case / conviction reason), if "
-    "stated or clearly implied. null if none is given.\n"
-    "- reasoning: one short sentence explaining the call.\n"
-    "Return ONLY valid JSON matching the schema. No markdown, no preamble."
-)
-
-SIGNAL_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "ticker": {"type": ["string", "null"]},
-        "asset_type": {"type": "string", "enum": ["stock", "crypto", "unknown"]},
-        "action": {"type": "string", "enum": ["buy", "sell", "position", "none"]},
-        "side": {"type": ["string", "null"], "enum": ["long", "short", None]},
-        "position_action": {"type": ["string", "null"], "enum": ["open", "add", "reduce", "close", "hold", None]},
-        "entry_status": {"type": "string", "enum": ["confirmed", "setup", "review", "recap", "commentary"]},
-        "event_kind": {"type": "string", "enum": list(EVENT_KINDS)},
-        "execution_evidence": {"type": ["string", "null"]},
-        "exit_price": {"type": ["number", "null"]},
-        "exit_fraction": {"type": ["number", "null"]},
-        "entry_trigger": {"type": ["string", "null"]},
-        "sell_kind": {"anyOf": [
-            {"type": "string", "enum": ["full", "partial"]},
-            {"type": "null"},
-        ]},
-        "size_pct": {"type": ["number", "null"]},
-        "entry_price": {"type": ["number", "null"]},
-        "stop_loss": {"type": ["number", "null"]},
-        "target": {"type": ["number", "null"]},
-        "trade_date": {"type": ["string", "null"]},
-        "holding_thesis": {"type": ["string", "null"]},
-        "confidence": {"type": "string",
-                       "enum": ["high", "medium", "low", "none"]},
-        "portfolio": {"anyOf": [
-            {"type": "string",
-             "enum": ["grok", "claude", "deepseek", "chatgpt", "gemini"]},
-            {"type": "null"},
-        ]},
-        "reasoning": {"type": "string"},
-    },
-    "required": ["ticker", "asset_type", "action", "sell_kind", "size_pct",
-                 "entry_price", "stop_loss", "target", "trade_date",
-                 "holding_thesis", "confidence", "portfolio", "reasoning",
-                 "side", "position_action", "entry_status", "event_kind",
-                 "execution_evidence", "exit_price", "exit_fraction", "entry_trigger"],
-    "additionalProperties": False,
-}
-
-LEVEL_EVIDENCE_SCHEMA = {
-    "type": "object", "properties": {k: {"type": ["string", "null"]}
-        for k in ("entry_price", "stop_loss", "target", "exit_price")},
-    "required": ["entry_price", "stop_loss", "target", "exit_price"],
-    "additionalProperties": False,
-}
-SIGNAL_SCHEMA["properties"]["level_evidence"] = LEVEL_EVIDENCE_SCHEMA
-SIGNAL_SCHEMA["required"].append("level_evidence")
-# One independent event per instrument; kept in a single billed text call.
-_ADDITIONAL_SIGNAL_SCHEMA = copy.deepcopy(SIGNAL_SCHEMA)
-SIGNAL_SCHEMA["properties"]["additional_signals"] = {"type": "array", "items": _ADDITIONAL_SIGNAL_SCHEMA}
-SIGNAL_SCHEMA["required"].append("additional_signals")
-EXTRACTION_SYSTEM += (
-    "\nCLASSIFY BEFORE EXTRACTING PRICES: event_kind is setup, entry, add, trim, "
-    "exit, holding, recap, commentary, or review. Watching/targets/new highs/"
-    "chart strength alone are never a confirmed holding. Top Pick weekly/YTD "
-    "results and educational reviews of completed trades are recap, action none; "
-    "they do not open/close a current position. For commentary/recap set side "
-    "and position_action null. Confirmed requires execution_evidence: a literal "
-    "fragment of THIS author's text explicitly saying they bought, sold, "
-    "trimmed, shorted, covered, or are currently holding THIS asset. A third "
-    "party's action is not their execution. Conditional entries are setup; "
-    "put the condition in entry_trigger. Do not invent activation thresholds. "
-    "level_evidence contains literal source fragments for every non-null price. "
-    "Do not treat a previous low, MA, support, resistance, current quote, "
-    "average exit or a return percentage as an entry/stop/target. exit_price "
-    "is an explicitly filled exit; exit_fraction is the fraction of the "
-    "REMAINING position sold (half=0.5), null if unspecified. Preserve the "
-    "nearest stated target in target, not the average of a target range. "
-    "For multiple assets return the first as the main event and one separately "
-    "classified event per other asset in additional_signals (otherwise []). "
-    "Execution and price evidence must belong to that specific instrument. "
-    "A watchlist addition is setup (not review), with null execution_evidence. "
-    "Never quote only 'Added $XYZ' and omit 'to the watchlist' as fill evidence."
-    " trade_date must be an exact stated day; vague phrases like early April "
-    "do not justify inventing April 5. Return null for uncertain dates."
-)
-
-# --- Chart-image (vision) extraction --------------------------------------
-# Influencer tweets frequently attach an annotated chart whose levels are NOT
-# in the tweet text (TP/stop lines drawn on the chart). This schema captures
-# what is readable FROM THE IMAGE so it can backfill the text extraction.
-VISION_SYSTEM = (
-    "You read an annotated stock/crypto price chart image attached to a "
-    "trader's tweet. Using the chart AND the tweet text, extract only what is "
-    "actually visible/marked on the chart. Do not invent levels.\n"
-    "- ticker: the symbol shown on the chart (e.g. on the axis/title), null if "
-    "not visible.\n"
-    "- tp1: the first/nearest take-profit or upside target price marked on the "
-    "chart, as a number. null if none is drawn.\n"
-    "- tp2: a second, higher take-profit/target price if a second one is "
-    "marked, as a number. null if absent.\n"
-    "- stop_loss: the stop-loss / invalidation price marked on the chart, as a "
-    "number. null if none is drawn.\n"
-    "- trend: the overall setup direction the chart implies: \"bullish\", "
-    "\"bearish\", or \"neutral\".\n"
-    "- chart_notes: ONE short sentence describing the technical setup shown "
-    "(pattern, key level, breakout/breakdown).\n"
-    "Return ONLY valid JSON matching the schema. No markdown, no preamble."
-)
-
-CHART_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "ticker": {"type": ["string", "null"]},
-        "tp1": {"type": ["number", "null"]},
-        "tp2": {"type": ["number", "null"]},
-        "stop_loss": {"type": ["number", "null"]},
-        "trend": {"type": "string",
-                  "enum": ["bullish", "bearish", "neutral"]},
-        "chart_notes": {"type": ["string", "null"]},
-    },
-    "required": ["ticker", "tp1", "tp2", "stop_loss", "trend", "chart_notes"],
-    "additionalProperties": False,
-}
-CHART_SCHEMA["properties"]["chart_kind"] = {"type": "string", "enum": ["price_chart", "performance_table", "other"]}
-CHART_SCHEMA["properties"]["level_evidence"] = {
-    "type": "object", "properties": {k: {"type": ["string", "null"]} for k in ("stop_loss", "tp1", "tp2")},
-    "required": ["stop_loss", "tp1", "tp2"], "additionalProperties": False,
-}
-CHART_SCHEMA["required"] += ["chart_kind", "level_evidence"]
-VISION_SYSTEM += (
-    "\nSet chart_kind to price_chart, performance_table, or other. A performance "
-    "table has no actionable price levels. For each non-null stop/tp give the "
-    "literal visible label in level_evidence (including its number and explicit "
-    "Stop/SL/Target/TP label). MA/support/resistance/axis values are not stops "
-    "or targets. Trend alone never proves an executed trade."
-)
-PROMPT_FINGERPRINT = hashlib.sha256(json.dumps(
-    [EXTRACTION_SYSTEM, SIGNAL_SCHEMA, VISION_SYSTEM, CHART_SCHEMA], sort_keys=True).encode()).hexdigest()
-with open(__file__, "rb") as _source_file, open(os.path.join(os.path.dirname(__file__), "signal_semantics.py"), "rb") as _semantics_file:
-    PARSER_FINGERPRINT = hashlib.sha256(_source_file.read() + _semantics_file.read()).hexdigest()
 
 
 class _NoMediaRedirects(urllib.request.HTTPRedirectHandler):
@@ -461,7 +213,11 @@ _MANGLED_RE = re.compile(
     "|[A-Za-z]'[aeiouAEIOU]"
     "|#\\d{1,3};"
     "|[A-Za-zÀ-ÿ]%\\d{3}|%\\d{3}[A-Za-zÀ-ÿ]")
+
+
 _MANGLED_CTRL_RE = re.compile(r"[\x00-\x1f]")   # full C0 range, no carve-outs
+
+
 _MANGLED_FRAG_RE = re.compile(r"(?<!\S)[b-df-rt-z](?!\S)")  # lowercase except a/e/s
 
 
@@ -476,475 +232,6 @@ def _looks_mangled(obj):
     return False
 
 
-
-def _gemini_usage(resp):
-    return token_usage(resp)
-
-
-class Interpreter:
-    """Wraps the Gemini client and tracks token usage for cost reporting."""
-
-    def __init__(self):
-        self.gemini_client = genai.Client()   # reads GOOGLE_API_KEY from env
-        self.calls = 0
-        self.errors = 0
-        self.successes = 0
-        self.input_tokens = 0
-        self.output_tokens = 0
-        # Vision usage tracked separately for cost reporting (different model).
-        self.vision_calls = 0
-        self.vision_errors = 0
-        self.vision_input_tokens = 0
-        self.vision_output_tokens = 0
-
-    def extract(self, text, account, tweet_date):
-        """Return the parsed signal dict, or None on API/parse error."""
-        user = (f"Posted by @{account}\nTweet date: {tweet_date}\n"
-                f"Tweet:\n{text}")
-        context = getattr(self, "thread_context", None)
-        if context:
-            user += ("\nEarlier OWN thread context, for instrument/direction ONLY. "
-                     "Extract executions and prices solely from the CURRENT tweet above; "
-                     "do not repeat the earlier entry or target:\n" + json.dumps(context))
-        try:
-            resp = self.gemini_client.models.generate_content(
-                model=MODEL,
-                contents=user,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=EXTRACTION_SYSTEM,
-                    response_mime_type="application/json",
-                    response_json_schema=SIGNAL_SCHEMA,
-                    thinking_config=EXTRACT_THINKING,
-                    max_output_tokens=1800,
-                ),
-            )
-        except genai_errors.APIError as e:
-            print(f"  [llm error] {type(e).__name__}: {e}", file=sys.stderr)
-            self.errors += 1
-            return None
-
-        self.calls += 1
-        in_tok, out_tok = _gemini_usage(resp)
-        self.input_tokens += in_tok
-        self.output_tokens += out_tok
-        parsed = parse_response(resp, SIGNAL_SCHEMA)
-        if parsed is None:
-            self.errors += 1
-        else:
-            self.successes += 1
-        return parsed
-
-    def extract_chart(self, media_urls, text, account, tweet_date):
-        """Run a Gemini vision pass over the tweet's chart image(s). Returns the
-        parsed chart dict, or None if no image could be fetched / on error."""
-        parts = [p for p in (_image_block(u)
-                             for u in media_urls[:MAX_VISION_IMAGES]) if p]
-        if not parts:
-            self.vision_errors += 1
-            return None
-        contents = parts + [f"Posted by @{account}\nTweet date: {tweet_date}\n"
-                            f"Tweet:\n{text}"]
-        try:
-            resp = self.gemini_client.models.generate_content(
-                model=VISION_MODEL,
-                contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=VISION_SYSTEM,
-                    response_mime_type="application/json",
-                    response_json_schema=CHART_SCHEMA,
-                    thinking_config=GEMINI_THINKING,
-                    max_output_tokens=650,
-                ),
-            )
-        except genai_errors.APIError as e:
-            print(f"  [vision error] {type(e).__name__}: {e}", file=sys.stderr)
-            self.vision_errors += 1
-            return None
-        self.vision_calls += 1
-        in_tok, out_tok = _gemini_usage(resp)
-        self.vision_input_tokens += in_tok
-        self.vision_output_tokens += out_tok
-        parsed = parse_response(resp, CHART_SCHEMA)
-        if parsed is None:
-            self.vision_errors += 1
-        return parsed
-
-    def cost(self):
-        return (self.input_tokens / 1_000_000 * EXTRACT_INPUT_PER_1M
-                + self.output_tokens / 1_000_000 * EXTRACT_OUTPUT_PER_1M)
-
-    def vision_cost(self):
-        return (self.vision_input_tokens / 1_000_000 * GEMINI_INPUT_PER_1M
-                + self.vision_output_tokens / 1_000_000 * GEMINI_OUTPUT_PER_1M)
-
-
-# Exit-phrasing detector for the reply gate below (currently unreachable: every
-# monitored account is "influencer" kind, which already bypasses that gate —
-# kept in case a non-influencer account is ever added back). Word-boundary
-# regex, not bare substrings: "cut" as a substring matched "exeCUTe"/"hairCUT".
-# Generous on purpose — a false positive only costs one Gemini call.
-SELL_PATTERN = re.compile(
-    r"\b(sold|selling|sell|dumped|dumping|exited|exiting|exit|"
-    r"trimmed|trimming|closed|closing|liquidated|liquidating|"
-    r"out of|cut|stopped out|scaled out|scaling out|reduced|reducing|"
-    r"took (?:some )?profits?|taking (?:some )?profits?|take profits?)\b",
-    re.IGNORECASE)
-
-# Retweet detector for the cross-account dedup gate. A retweet is a verbatim
-# copy of another account's tweet, so when the ORIGINAL author is itself a
-# monitored account we already ingest that tweet directly — re-interpreting the
-# RT only creates a duplicate signal. The drop is SCOPED to monitored authors:
-# RTs of NON-monitored accounts are KEPT, since they can be the sole source of
-# a signal. .match() anchors at string start.
-RETWEET_PATTERN = re.compile(r"RT @(\w+):", re.IGNORECASE)
-_MONITORED_LC = {a.lower() for a in ACCOUNTS}
-
-
-def is_reply(text):
-    return text.lstrip().startswith("@")
-
-
-def tweet_is_reply(tw):
-    """True if the tweet is a reply. Prefers the source's explicit is_reply
-    flag (GetXAPI sets it via _normalize_getxapi); falls back to the text
-    heuristic for the official API / old snapshots. The heuristic alone
-    misfired both ways: a fresh tweet that merely BEGINS with a mention
-    ("@NVIDIA is a buy") was dropped as a reply, and replies whose text
-    doesn't start with "@" bypassed the gate."""
-    ir = tw.get("is_reply")
-    if isinstance(ir, bool):
-        return ir
-    return is_reply(tw.get("text", ""))
-
-
-def foreign_author(account, tw):
-    """True if the tweet was authored by someone OTHER than the monitored
-    account. tweets_and_replies returns the whole conversation thread, so a
-    follower's reply can ride along; without this it would be extracted as the
-    account's own signal. Author is compared case-insensitively. When the field
-    is absent (old snapshots / --source official) we keep the tweet (return
-    False) so existing behaviour is preserved."""
-    author = tw.get("author")
-    return bool(author) and author.lower() != account.lower()
-
-
-def reply_has_sell_verb(text):
-    """A reply worth keeping: it mentions a sell so we don't miss exits."""
-    return bool(SELL_PATTERN.search(text or ""))
-
-
-def is_duplicate_retweet(text):
-    """True if `text` is a retweet of a MONITORED account — a cross-account
-    duplicate of a tweet we ingest from the original author directly, so it is
-    dropped pre-LLM. Retweets of NON-monitored accounts return False (kept):
-    they can be the sole source of a signal. See RETWEET_PATTERN."""
-    m = RETWEET_PATTERN.match((text or "").lstrip())
-    return bool(m) and m.group(1).lower() in _MONITORED_LC
-
-
-def _grounded_price(value, evidence, role, text=None):
-    """Accept a level only with a literal source label and matching number."""
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < value < float("inf"):
-        return None
-    if not isinstance(evidence, str) or not evidence.strip():
-        return None
-    if text is not None and not quote_in_text(evidence, text):
-        return None
-    if role == "target" and text is not None:
-        own_target = re.search(r"\$?(\d[\d,]*(?:\.\d+)?)([kKmM]?)\s+(?:is\s+)?(?:my|our)\s+target\b", evidence, re.I)
-        if own_target:
-            return float(own_target[1].replace(",", "")) * {"k": 1000, "m": 1_000_000}.get(own_target[2].lower(), 1)
-    if role == "target" and text is not None:
-        flat, quote = " ".join(text.split()).casefold(), " ".join(evidence.split()).casefold()
-        index = flat.find(quote)
-        context = flat[max(0, index - 35):index + len(quote)]
-        if re.search(r"\b(?:analysts?|consensus|wall street)\b", context, re.I):
-            return None
-    roles = {"entry_price": r"\b(?:entry|bought|buy|buying|entered|purchased|filled|fill|shorted)\b",
-             "exit_price": r"\b(?:sold|exit|exited|covered|closed|trimmed|booked|profits)\b",
-             "stop_loss": r"\b(?:stop|sl|stoploss)\b",
-             "target": r"\b(?:target|targets|tp|tp1|tp2|take.profit)\b"}
-    if not re.search(roles[role], evidence, re.I):
-        return None
-    numbers = []
-    for match in re.finditer(r"(?<![A-Za-z0-9])(\d[\d,]*(?:\.\d+)?)([kKmM]?)(?![A-Za-z0-9])", evidence):
-        if evidence[match.end():].lstrip().startswith("%"):
-            continue
-        n = float(match[1].replace(",", "")) * {"k": 1000, "m": 1_000_000}.get(match[2].lower(), 1)
-        numbers.append(n)
-    if role in ("entry_price", "exit_price"):
-        anchors = []
-        for match in re.finditer(r"\b(?:at|entry(?: price)?|exit(?: price)?|fill(?: price)?|price)\b\s*[:=@]?\s*\$?\s*(\d[\d,]*(?:\.\d+)?)([kKmM]?)", evidence, re.I):
-            if not evidence[match.end():].lstrip().startswith("%"):
-                anchors.append(float(match[1].replace(",", "")) * {"k": 1000, "m": 1_000_000}.get(match[2].lower(), 1))
-        numbers = anchors
-    if role == "stop_loss":
-        numbers = []
-        for match in re.finditer(r"\b(?:stop(?:[ -]?loss)?|sl)\b\s*(?:at\s+|is\s+|price\s+)?[:=@-]?\s*\$?\s*(\d[\d,]*(?:\.\d+)?)([kKmM]?)", evidence, re.I):
-            if not evidence[match.end():].lstrip().startswith("%"):
-                numbers.append(float(match[1].replace(",", "")) * {"k": 1000, "m": 1_000_000}.get(match[2].lower(), 1))
-    if role == "target":
-        numbers = []
-        for match in re.finditer(r"\b(?:targets?|tp\d*|take.profit)\b\s*(?:are\s+|at\s+)?[:=@-]?\s*\$?\s*(\d[\d,]*(?:\.\d+)?)([kKmM]?)", evidence, re.I):
-            if not evidence[match.end():].lstrip().startswith("%"):
-                numbers.append(float(match[1].replace(",", "")) * {"k": 1000, "m": 1_000_000}.get(match[2].lower(), 1))
-    if role == "target" and text is not None:
-        first = re.search(r"\b(?:targets?|tp\d*|take.profit)\b\s*(?:are\s+|at\s+)?[:=@-]?\s*\$?\s*(\d[\d,]*(?:\.\d+)?)([kKmM]?)", evidence, re.I)
-        if first:
-            if not evidence[first.end():].lstrip().startswith("%"):
-                return float(first[1].replace(",", "")) * {"k": 1000, "m": 1_000_000}.get(first[2].lower(), 1)
-    return next((n for n in numbers if abs(value - n) <= max(0.01, abs(value) * 0.00001)), None)
-
-
-def merge_chart(parsed, chart):
-    """Fold a vision/chart extraction into the text-extracted signal dict.
-    Image data only FILLS GAPS — text-stated values win. Chart-only fields
-    (tp1/tp2/trend/chart_notes) are added. Returns True if anything improved."""
-    if not parsed or not chart:
-        return False
-    if chart.get("chart_kind") != "price_chart":
-        return False
-    chart = dict(chart)
-    evidence = chart.get("level_evidence") or {}
-    for key, role in (("stop_loss", "stop_loss"), ("tp1", "target"), ("tp2", "target")):
-        chart[key] = _grounded_price(chart.get(key), evidence.get(key), role)
-    sources = parsed.setdefault("level_sources", {})
-    improved = False
-    # ticker / stop_loss: backfill only when text gave nothing.
-    if not parsed.get("ticker") and chart.get("ticker"):
-        parsed["ticker"] = chart["ticker"]
-        improved = True
-    if parsed.get("stop_loss") is None and chart.get("stop_loss") is not None:
-        parsed["stop_loss"] = chart["stop_loss"]
-        sources["stop_loss"] = {"source": "chart", "evidence": evidence.get("stop_loss")}
-        improved = True
-    # target: text `target`, else the chart's first take-profit.
-    if parsed.get("target") is None and chart.get("tp1") is not None:
-        parsed["target"] = chart["tp1"]
-        sources["target"] = {"source": "chart", "evidence": evidence.get("tp1")}
-        improved = True
-    # Chart-only enrichments (always recorded when present).
-    for k in ("tp1", "tp2", "trend", "chart_notes"):
-        if chart.get(k) is not None:
-            parsed[k] = chart[k]
-            if k in ("tp1", "tp2", "chart_notes"):
-                improved = True
-    return improved
-
-
-def promote_with_chart(parsed, chart):
-    """When the text pass found no actionable signal but the tweet carries a
-    chart, let a clearly-directional chart promote it to a trade. Requires a
-    ticker (from text or backfilled from the chart by merge_chart) and a
-    non-neutral trend. Returns True if it promoted."""
-    if not parsed or not chart:
-        return False
-    if parsed.get("action") != "none" or not parsed.get("ticker"):
-        return False
-    trend = chart.get("trend")
-    if chart.get("chart_kind") != "price_chart":
-        return False
-    if trend == "bullish":
-        parsed["action"] = "buy"
-        parsed["side"] = "long"
-    elif trend == "bearish":
-        parsed["action"] = "sell"
-        parsed["side"] = "short"
-    else:
-        return False
-    parsed.update(event_kind="setup", position_action="open", entry_status="setup",
-                  sell_kind=None, execution_evidence=None)
-    # Chart-only calls are inherently softer; medium keeps them out of the
-    # low/none confidence gate so they still register as positions.
-    if parsed.get("confidence") in (None, "none", "low"):
-        parsed["confidence"] = "medium"
-    note = chart.get("chart_notes")
-    parsed["reasoning"] = ("Chart-only signal: " + note) if note else \
-        "Chart-only signal (promoted from annotated chart)."
-    return True
-
-
-def _mentions_asset(parsed, text):
-    """Heuristic gate for the influencer chart pass on non-actionable text:
-    run vision only when an asset is plausibly in play (text named a ticker,
-    or the tweet carries a cashtag) to bound vision spend."""
-    if parsed and parsed.get("ticker"):
-        return True
-    return "$" in (text or "")
-
-
-def _sane_size_pct(v):
-    """Deterministic backstop against dollar-amounts-as-percent leakage
-    (e.g. "took our $50,000 and bought $PGY" -> size_pct=50000). A position
-    weight is only meaningful in (0, 100]; anything else is a misextraction,
-    so null it. Independent of the LLM/schema so it always holds."""
-    if not isinstance(v, (int, float)) or isinstance(v, bool):
-        return None
-    return v if 0 < v <= 100 else None
-
-
-def _crypto_ref(*vals):
-    """Largest positive numeric value among the magnitude-reference candidates
-    (entry_price, then the take-profit levels tp1/tp2), or None if none qualify.
-    Recap tweets usually carry no entry_price but DO carry chart tp1/tp2 in full
-    dollars, so those backstop the reference when entry is absent."""
-    nums = [v for v in vals
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0]
-    return max(nums) if nums else None
-
-
-def _sane_crypto_level(level, ref, asset_type):
-    """Backstop for $K-shorthand misparse on crypto price levels: a tweet that
-    writes "54-50" or "144K" for $54K/$50K/$144K is sometimes extracted as the
-    bare 50 / 144. For crypto, if a stop_loss/target is below a hundredth of the
-    reference magnitude (entry price, else a tp1/tp2 take-profit level) it is
-    almost certainly a dropped-thousands error, so scale it back up by 1000.
-    The threshold is ref/100, not ref/10: the error is always a factor of 1000
-    (so a bad value lands near ref/1000, well under ref/100), while a take-profit
-    can legitimately sit 10x+ above a stop — ref/10 would false-positive on a
-    cheap coin with a far target. No-op without a positive reference or when the
-    value already looks sane. Independent of the LLM so it always holds."""
-    if asset_type != "crypto":
-        return level
-    if not isinstance(level, (int, float)) or isinstance(level, bool) or level <= 0:
-        return level
-    if not isinstance(ref, (int, float)) or isinstance(ref, bool) or ref <= 0:
-        return level
-    return level * 1000 if level < ref / 100 else level
-
-
-def record_from_parsed(account, tw, parsed):
-    """Build a trades.json signal record from a parsed LLM result, or None if
-    it isn't an actionable signal. Shared by the real-time and batch paths."""
-    if not parsed:
-        return None
-    if parsed.get("action") == "none" and parsed.get("event_kind") not in ("recap", "setup", "review"):
-        return None
-    if not parsed.get("ticker"):
-        return None
-    parsed["size_pct"] = _sane_size_pct(parsed.get("size_pct"))
-    _stop = parsed.get("stop_loss")
-    _target = parsed.get("target")
-    now = datetime.now(timezone.utc).isoformat()
-    record = {
-        "account": account,
-        "source_type": SOURCE_TYPE.get(account, "portfolio"),
-        "portfolio": parsed.get("portfolio"),
-        "tweet_id": tw["id"],
-        "timestamp": tw.get("created_at"),
-        "signal_type": parsed["action"],
-        "side": parsed.get("side"),
-        "model_side": parsed.get("side"),
-        "position_action": parsed.get("position_action"),
-        "entry_status": parsed.get("entry_status"),
-        "sell_kind": parsed.get("sell_kind"),
-        "confidence": parsed["confidence"],
-        "actionable": parsed["action"] in ("buy", "sell", "position"),
-        "tickers": [parsed["ticker"]],
-        "asset_type": parsed.get("asset_type", "unknown"),
-        "position_size_pct": parsed["size_pct"],
-        "entry_price": parsed["entry_price"],
-        "stop_loss": _stop,
-        "target": _target,
-        "trade_date": parsed.get("trade_date"),
-        "holding_thesis": parsed.get("holding_thesis"),
-        "reasoning": parsed["reasoning"],
-        # Chart-image (vision) enrichments — populated only for influencer
-        # tweets that carried an analyzable chart photo (else null).
-        "tp1": parsed.get("tp1"),
-        "tp2": parsed.get("tp2"),
-        "chart_trend": parsed.get("trend"),
-        "chart_notes": parsed.get("chart_notes"),
-        "has_chart": bool(tw.get("media")),
-        "url": f"https://x.com/{account}/status/{tw['id']}",
-        "text": tw.get("text", ""),
-        "event_kind": parsed.get("event_kind"),
-        "execution_evidence": parsed.get("execution_evidence"),
-        "entry_trigger": parsed.get("entry_trigger"),
-        "exit_price": parsed.get("exit_price"),
-        "exit_fraction": parsed.get("exit_fraction"),
-        "level_sources": parsed.get("level_sources", {}),
-        "published_at": tw.get("created_at"),
-        "first_observed_at": tw.get("first_observed_at") if "first_observed_at" in tw else now,
-        "extracted_at": now,
-        "model": MODEL,
-        "prompt_version": "signal-v3",
-        "prompt_fingerprint": PROMPT_FINGERPRINT,
-        "parser_fingerprint": PARSER_FINGERPRINT,
-        "reply_to_tweet_id": tw.get("reply_to_tweet_id"),
-        "conversation_id": tw.get("conversation_id"),
-        "thread_context": tw.get("thread_context"),
-        "media": tw.get("media", []),
-    }
-    record = normalize_event(record)
-    if record["event_kind"] == "commentary":
-        return None
-    if not record["tickers"]:
-        return None
-    record["signal_id"] = f"{tw['id']}:{record['tickers'][0]}:{record['event_kind']}"
-    return record
-
-
-def build_signals(account, tw, interp):
-    tweet_date = (tw.get("created_at") or "")[:10]
-    text = tw.get("text", "")
-    interp.thread_context = tw.get("thread_context")
-    parsed = interp.extract(text, account, tweet_date)
-    if parsed is None:
-        return []
-    interp.last_decision = copy.deepcopy(parsed)
-    entries = [parsed, *parsed.get("additional_signals", [])]
-    records = []
-    for parsed in entries:
-        parsed = copy.deepcopy(parsed)
-        context = tw.get("thread_context") or {}
-        context_symbols = context.get("tickers") or []
-        if not parsed.get("ticker") and len(context_symbols) == 1:
-            parsed["ticker"] = context_symbols[0]
-        explicit = set(re.findall(r"\$([A-Z][A-Z0-9.]*)", text))
-        if len(context_symbols) > 1 and parsed.get("ticker") not in explicit and parsed.get("event_kind") in ("entry", "add", "trim", "exit", "holding"):
-            parsed.update(event_kind="review", entry_status="review", execution_evidence=None)
-        sources = parsed.setdefault("level_sources", {})
-        proof = parsed.get("level_evidence") or {}
-        for key in ("entry_price", "stop_loss", "target", "exit_price"):
-            parsed[key] = _grounded_price(parsed.get(key), proof.get(key), key, text)
-            if parsed[key] is not None:
-                sources[key] = {"source": "text", "evidence": proof[key]}
-        # Explicitly labelled chart levels may enrich this instrument's idea.
-        # A bare chart may become a setup, never an executed holding.
-        actionable = parsed["action"] != "none" and parsed.get("ticker")
-        bare_chart = bool(re.fullmatch(r"\s*\$[A-Za-z][A-Za-z0-9.]*\s*(?:https?://\S+\s*)?", text))
-        if (SOURCE_TYPE.get(account) == "influencer" and tw.get("media")
-                and parsed.get("event_kind") != "recap"
-                and (parsed.get("event_kind") != "commentary" or bare_chart)
-                and (actionable or _mentions_asset(parsed, text))):
-            chart = interp.extract_chart(tw["media"], text, account, tweet_date)
-            # Never attach another instrument's chart levels to this event.
-            if chart and chart.get("ticker") and parsed.get("ticker") and chart["ticker"].lstrip("$").upper() != parsed["ticker"].lstrip("$").upper():
-                chart = None
-            merge_chart(parsed, chart)
-            if not actionable:
-                promote_with_chart(parsed, chart)
-        record = record_from_parsed(account, tw, parsed)
-        if record:
-            records.append(record)
-    return records
-
-
-def build_signal(account, tw, interp):
-    """Compatibility wrapper for callers interested in the first event."""
-    records = build_signals(account, tw, interp)
-    return records[0] if records else None
-
-
-def should_send_to_llm(tw):
-    """The pre-LLM gate: keep non-replies, and replies only if they mention a
-    sell. Returns True if this tweet should be interpreted."""
-    if tweet_is_reply(tw):
-        return reply_has_sell_verb(tw.get("text", ""))
-    return True
-
-
 # --- env / io --------------------------------------------------------------
 def load_env(path):
     if not os.path.exists(path):
@@ -955,34 +242,6 @@ def load_env(path):
             continue
         k, v = line.split("=", 1)
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-
-
-# --- Twitter fetch ---------------------------------------------------------
-def api_get(url):
-    req = urllib.request.Request(url)
-    req.add_header("Authorization", f"Bearer {os.environ['X_BEARER_TOKEN']}")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.load(resp)
-
-
-def fetch_tweets(uid, since_id=None):
-    collected, token = [], None
-    while len(collected) < MAX_FETCH:
-        params = {
-            "max_results": min(100, max(5, MAX_FETCH - len(collected))),
-            "tweet.fields": "created_at,text,referenced_tweets",
-        }
-        if since_id:
-            params["since_id"] = since_id
-        if token:
-            params["pagination_token"] = token
-        data = api_get(f"{API_BASE}/users/{uid}/tweets?{urllib.parse.urlencode(params)}")
-        batch = data.get("data", [])
-        collected.extend(batch)
-        token = data.get("meta", {}).get("next_token")
-        if not token or not batch:
-            break
-    return collected[:MAX_FETCH]
 
 
 # --- GetXAPI fetch (alternative backend, ~100x cheaper) --------------------
@@ -999,45 +258,6 @@ def getxapi_get(url):
         if resp.headers.get("Content-Encoding") == "gzip":
             body = gzip.decompress(body)
     return json.loads(body)
-
-
-# GetXAPI is an unaffiliated scraper with no SLA: its upstream proxy
-# intermittently truncates responses mid-body (http.client.IncompleteRead) or
-# drops the connection (RemoteDisconnected). Without retry, ONE such blip on any
-# account aborts the whole monitor run and the state is left unwritten, so the
-# next cron retries from scratch -- a flaky proxy then keeps the pipeline down
-# for many cycles (observed: 6 consecutive failed runs / ~24h). Retry transient
-# read/network errors with a short linear backoff; permanent 4xx (except 429)
-# raise immediately. Mirrors twitter_digest._getxapi_get_retry.
-# 2026-07-13: bumped 3->5 after twitter_digest's kendrick_sc (search endpoint,
-# bigger/less-reliably-compressed payloads than this module's timeline fetch)
-# twice exhausted 3 attempts and logged a warning. This module's own timeline
-# fetch has never needed more than 2 of its 3 attempts in practice, so the
-# higher ceiling costs it nothing -- kept in sync rather than diverging the
-# two "mirrored" retry wrappers.
-GETXAPI_RETRIES = 5
-GETXAPI_BACKOFF_S = 3
-_TRANSIENT_NET = (http.client.HTTPException, OSError)   # OSError covers URLError
-
-
-def getxapi_get_retry(url):
-    last = None
-    for attempt in range(1, GETXAPI_RETRIES + 1):
-        try:
-            return getxapi_get(url)
-        except urllib.error.HTTPError as e:
-            if e.code < 500 and e.code != 429:
-                raise                                  # permanent -> don't retry
-            last = e
-        except _TRANSIENT_NET as e:
-            last = e
-        if attempt < GETXAPI_RETRIES:
-            wait = GETXAPI_BACKOFF_S * attempt
-            print(f"  [getxapi] transient {type(last).__name__} "
-                  f"(attempt {attempt}/{GETXAPI_RETRIES}); retrying in {wait}s",
-                  file=sys.stderr)
-            time.sleep(wait)
-    raise last
 
 
 def _normalize_getxapi(tw):
@@ -1087,366 +307,6 @@ def _tweet_page(data):
     return batch
 
 
-def fetch_getxapi(account, since_id=None, max_pages=None):
-    """Cursor-paginate the bounded overlap window; pinned/known posts do not stop it. max_pages caps the calls (quick runs). Returns (tweets, n_api_calls)."""
-    collected, cursor, calls = [], None, 0
-    cursors = set()
-    path = (GETXAPI_POSTS_PATH if account in POSTS_ONLY_ACCOUNTS
-            else GETXAPI_TWEETS_PATH)
-    while len(collected) < MAX_FETCH and (max_pages is None or calls < max_pages):
-        params = {"userName": account}
-        if cursor:
-            params["cursor"] = cursor
-        data = getxapi_get_retry(
-            f"{GETXAPI_BASE}{path}?{urllib.parse.urlencode(params)}")
-        calls += 1
-        batch = _tweet_page(data)
-        if not batch:
-            break
-        for tw in batch:
-            n = _normalize_getxapi(tw)
-            collected.append(n)
-        if not data.get("has_more"):
-            break
-        cursor = data.get("next_cursor")
-        if not cursor or cursor in cursors:
-            break
-        cursors.add(cursor)
-    if len(collected) >= MAX_FETCH and data.get("has_more"):
-        print(f"WARNING: {account}: fetch cap reached; older undiscovered posts may remain", file=sys.stderr)
-    return collected, calls
-
-
-def tweets_for_account(account, state, backfill, source, quick=False):
-    """Return (tweets, twitter_reads, api_calls). Backfill reads local snapshots."""
-    if backfill:
-        snapshot = RAW_FILES.get(account)
-        if not snapshot or not os.path.isfile(snapshot):
-            raise FileNotFoundError(f"No backfill snapshot for {account}")
-        return load_ledger(snapshot, []), 0, 0
-    since_id = state.get(account, {}).get("newest_id")
-    if source == "getxapi":
-        tweets, calls = fetch_getxapi(account, since_id=since_id,
-                                       max_pages=1 if quick else None)
-    else:
-        uid = api_get(f"{API_BASE}/users/by/username/{account}")["data"]["id"]
-        tweets = fetch_tweets(uid, since_id=since_id)
-        calls = 0          # official is billed per tweet, not per call
-    if tweets:
-        newest = str(max(int(t["id"]) for t in tweets if str(t["id"]).isdigit()))
-        if not since_id or int(newest) > int(since_id):
-            # update in place so sibling keys (e.g. last_fetch) survive
-            state.setdefault(account, {})["newest_id"] = newest
-    return tweets, len(tweets), calls
-
-
-@single_writer(lambda: TRADES_FILE)
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--backfill", action="store_true",
-                    help="interpret local tweets_*.json instead of fetching X")
-    ap.add_argument("--backfill-batch", action="store_true",
-                    help="alias for --backfill (kept for the existing crontab; "
-                         "the Anthropic Batch API this once used is retired)")
-    ap.add_argument("--batch", action="store_true",
-                    help="accepted for the existing crontab; a no-op now (Gemini "
-                         "calls always run real-time -- see CLAUDE.md)")
-    ap.add_argument("--source", choices=["official", "getxapi"], default="getxapi",
-                    help="tweet backend: getxapi (default, tweets_and_replies) "
-                         "or official X API")
-    ap.add_argument("--quick", action="store_true",
-                    help="getxapi: fetch only the newest page per account (the "
-                         "full overlap window is for the scheduled full scans)")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="fetch fresh + analyze, but write NOTHING (no trades.json, "
-                         "positions.json, or state). Dumps would-be signals to "
-                         "/tmp/pilot_dryrun_<source>.json for comparison.")
-    ap.add_argument("--account", choices=ACCOUNTS,
-                    help="restrict to ONE account. With --backfill, rebuilds only "
-                         "that account's signals in trades.json, preserving all "
-                         "others. Without it, just limits the live fetch.")
-    args = ap.parse_args()
-    if args.backfill_batch:            # --backfill-batch is now just --backfill
-        args.backfill = True
-    if args.batch:
-        print("note: --batch no longer submits a batch job (Gemini calls run "
-              "real-time); flag kept for crontab compatibility.")
-
-    load_env(ENV_FILE)
-    if not os.environ.get("GOOGLE_API_KEY"):
-        print("GOOGLE_API_KEY is not set. Add it to ~/pilot_trader/.env "
-              "and re-run.", file=sys.stderr)
-        sys.exit(1)
-    if not args.backfill:
-        need = "GETXAPI_KEY" if args.source == "getxapi" else "X_BEARER_TOKEN"
-        if not os.environ.get(need):
-            print(f"{need} is not set. Add it to ~/pilot_trader/.env and re-run.",
-                  file=sys.stderr)
-            sys.exit(1)
-
-    interp = Interpreter()
-
-    state = load_ledger(STATE_FILE, {})
-    if not (args.backfill or args.dry_run):
-        _report_staleness(state)   # warn if prior runs were missed/failed
-    # Backfill rebuilds trades.json from the local snapshots, so it starts from a
-    # clean slate (otherwise dedup against prior signals would skip every tweet).
-    # Dry-run also starts clean and ignores stored state so it fetches a fresh,
-    # comparable batch from the live API (otherwise since_id would return ~nothing).
-    # --account --backfill rebuilds ONE account: drop its old signals, keep every
-    # OTHER account's, then re-interpret it from its snapshot. A live --account
-    # run must NOT drop (the incremental since_id fetch won't re-add history), so
-    # it just restricts the loop and adds incrementally.
-    existing = [] if args.dry_run else load_ledger(TRADES_FILE, [])
-    decisions_file = os.path.join(os.path.dirname(TRADES_FILE), "data", "signal_decisions.json")
-    decisions = [] if args.dry_run else load_ledger(decisions_file, [])
-    source_posts = {(r["account"], str(r["tweet_id"])): r for r in [*existing, *decisions]}
-    seen_ids = {r["tweet_id"] for r in existing} | {r["tweet_id"] for r in decisions
-        if r.get("prompt_fingerprint") == PROMPT_FINGERPRINT and r.get("parser_fingerprint") == PARSER_FINGERPRINT}
-    if args.backfill:
-        seen_ids = set()  # replace only IDs actually present in the snapshot
-    replacement_keys = set()
-    run_state = {} if args.dry_run else state    # throwaway state in dry-run
-    accounts = [args.account] if args.account else ACCOUNTS
-
-    all_new, total_reads, total_skipped, total_sell_cand, total_calls = \
-        [], 0, 0, 0, 0
-    fetch_failures = []      # accounts whose GetXAPI fetch failed after retries
-    attempted = 0            # accounts that reached the fetch (not slow-skipped)
-    now = datetime.now(timezone.utc)
-    for account in accounts:
-        # High-water mark of tweet ids already PROCESSED in a prior run. GetXAPI
-        # returns the full latest page every run (no server-side since_id), so
-        # without this every non-signal tweet on the page is re-sent to the LLM
-        # each run (only SIGNAL-bearing tweets land in trades.json -> seen_ids).
-        # newest_id is advanced inside tweets_for_account below, so capture it
-        # first. Live mode only: backfill/dry-run must scan the whole snapshot.
-        prior_newest = None
-        if not (args.backfill or args.dry_run):
-            prior_newest = (run_state.get(account) or {}).get("newest_id")
-        attempted += 1
-        try:
-            tweets, reads, calls = tweets_for_account(
-                account, run_state, args.backfill, args.source, args.quick)
-        except urllib.error.HTTPError as e:
-            print(f"[{account}] HTTP {e.code}: "
-                  f"{e.read().decode('utf-8', 'replace')}", file=sys.stderr)
-            fetch_failures.append(account)
-            continue
-        except (http.client.HTTPException, OSError, ValueError) as e:
-            # Exhausted-retry transient GetXAPI error (IncompleteRead /
-            # RemoteDisconnected) on ONE account: skip just this account so a
-            # single flaky upstream doesn't abort the whole run (which would
-            # discard candidates already extracted from earlier accounts and
-            # leave state unwritten). Mirrors twitter_digest's per-feed isolation.
-            print(f"[{account}] fetch failed after retries "
-                  f"({type(e).__name__}: {e}); skipping account", file=sys.stderr)
-            fetch_failures.append(account)
-            continue
-        # Record the fetch time so POLL_MIN_INTERVAL_H accounts can pace
-        # themselves off "last fetch", not an exact cron hour.
-        if not (args.backfill or args.dry_run):
-            run_state.setdefault(account, {})["last_fetch"] = now.isoformat()
-        total_reads += reads
-        total_calls += calls
-        # Persist failed tweet payloads, not just IDs: the upstream's latest
-        # page can move past them before Gemini recovers. Successful signals
-        # are deduped against trades even after a crash between ledger/state writes.
-        pending = ((run_state.get(account) or {}).get("pending_tweets") or []) \
-            if not args.backfill else []
-        retry_ids = {tw["id"] for tw in pending}
-        tweets = list({tw["id"]: tw for tw in [*tweets, *pending]}.values())
-        for tw in tweets:
-            if not foreign_author(account, tw):
-                source_posts[(account, str(tw["id"]))] = tw
-        still_pending = []
-        new, skipped, sell_cand, foreign, seen, retweet = 0, 0, 0, 0, 0, 0
-        for tw in tweets:
-            if tw["id"] in seen_ids:
-                continue
-            # A lower ID is not proof we processed it: newly fetched own replies
-            # and posts revealed behind pins can be older than newest_id.
-            # Successful rejection decisions now provide durable dedup too.
-            # Drop thread replies authored by OTHER users (tweets_and_replies
-            # returns the whole conversation). Without this a follower's reply
-            # is mis-extracted as the account's own signal.
-            if foreign_author(account, tw):
-                foreign += 1
-                continue
-            # Posts-only accounts: drop ANY reply (incl. the account's own
-            # self-thread replies) so only original posts are extracted.
-            if account in POSTS_ONLY_ACCOUNTS and tw.get("is_reply"):
-                skipped += 1
-                continue
-            text = tw.get("text", "")
-            # Drop retweets of OTHER monitored accounts (verbatim dupes of a
-            # tweet we ingest from the original author directly). Runs for ALL
-            # accounts, including influencers, before their reply-gate bypass.
-            if is_duplicate_retweet(text):
-                retweet += 1
-                continue
-            # Influencer accounts (e.g. @IncomeSharks) bypass the reply gate —
-            # every tweet AND reply is sent to the LLM.
-            if tweet_is_reply(tw) and SOURCE_TYPE.get(account) != "influencer":
-                # Replies are skipped UNLESS they mention a sell — those we keep
-                # so we don't miss exits disclosed in @-reply threads.
-                if reply_has_sell_verb(text):
-                    sell_cand += 1
-                else:
-                    skipped += 1
-                    continue
-            errors_before = interp.errors
-            tw.setdefault("first_observed_at", None if args.backfill else now.isoformat())
-            earlier = next((r.get("first_observed_at") for r in decisions
-                            if r.get("account") == account and r.get("tweet_id") == tw["id"] and r.get("first_observed_at")), None)
-            if earlier:
-                tw["first_observed_at"] = min(earlier, tw.get("first_observed_at") or earlier)
-            parent_id = tw.get("reply_to_tweet_id") or tw.get("conversation_id")
-            parent = source_posts.get((account, str(parent_id)))
-            if parent is None and tw.get("conversation_id"):
-                parent_id = tw["conversation_id"]
-                parent = source_posts.get((account, str(parent_id)))
-            if parent and str(parent_id) != str(tw["id"]):
-                symbols = parent.get("tickers") or list(dict.fromkeys(
-                    s for s in re.findall(r"\$([A-Z][A-Z0-9.]*)", parent.get("text") or "") if not is_junk_ticker(s)))
-                if symbols:
-                    tw["thread_context"] = dict(tweet_id=str(parent_id), tickers=symbols,
-                        side=parent.get("side"), text=(parent.get("text") or "")[:1200])
-            sigs = build_signals(account, tw, interp)
-            if interp.errors > errors_before:
-                still_pending.append(tw)
-                continue
-            if args.backfill:
-                replacement_keys.add((account, tw["id"]))
-            decision = {
-                "account": account, "tweet_id": tw["id"], "published_at": tw.get("created_at"),
-                "first_observed_at": tw.get("first_observed_at"), "text": tw.get("text", ""),
-                "media": tw.get("media", []), "reply_to_tweet_id": tw.get("reply_to_tweet_id"),
-                "conversation_id": tw.get("conversation_id"), "thread_context": tw.get("thread_context"),
-                "extracted_at": datetime.now(timezone.utc).isoformat(), "model": MODEL,
-                "prompt_version": "signal-v3", "accepted_signal_ids": [s["signal_id"] for s in sigs],
-                "prompt_fingerprint": PROMPT_FINGERPRINT, "parser_fingerprint": PARSER_FINGERPRINT,
-                "decision": getattr(interp, "last_decision", None),
-                "reason": "classified" if sigs else "no_grounded_trade_or_setup",
-            }
-            decisions.append(decision)
-            all_new.extend(sigs)
-            seen_ids.add(tw["id"])
-            new += len(sigs)
-        if not (args.backfill or args.dry_run):
-            run_state.setdefault(account, {})["pending_tweets"] = still_pending
-        total_skipped += skipped
-        total_sell_cand += sell_cand
-        print(f"[{account}] scanned {len(tweets)}, already-seen-skipped {seen}, "
-              f"foreign-author-skipped {foreign}, retweet-skipped {retweet}, "
-              f"reply-skipped {skipped}, "
-              f"reply-sell-candidate {sell_cand}, new signals {new}")
-
-    # If EVERY attempted account failed to fetch, this is a total GetXAPI outage:
-    # defer the whole run (leave state unwritten so the next run refetches via the
-    # high-water gate) and alert, instead of writing a fresh _last_run that would
-    # mask the outage as a healthy run on the dashboard.
-    if attempted and len(fetch_failures) == attempted:
-        msg = (f"all {attempted} account fetch(es) failed after retries "
-               f"({', '.join(fetch_failures)}) -- deferring run")
-        print(f"ERROR: {msg}", file=sys.stderr)
-        sys.exit(1)
-    if fetch_failures:
-        print(f"WARNING: {len(fetch_failures)}/{attempted} account(s) failed "
-              f"fetch after retries, continuing with the rest: "
-              f"{', '.join(fetch_failures)}", file=sys.stderr)
-
-    # extract() swallows genai_errors.APIError per-call and returns None, so a
-    # total Gemini outage (bad key, denied project, exhausted quota) still lets
-    # the run "succeed" and refresh _last_run -- the staleness alert never
-    # fires. Mirror the GetXAPI-outage alert above: every attempted call failed
-    # and none succeeded this run.
-    if interp.errors and not interp.successes and not args.dry_run:
-        print(f"ERROR: all {interp.errors} Gemini text-extraction operations failed",
-              file=sys.stderr)
-
-    if args.backfill and (interp.errors or fetch_failures) and not args.dry_run:
-        raise RuntimeError("Backfill incomplete; preserving the existing trades ledger")
-    if args.backfill:
-        existing = [r for r in existing if (r.get("account"), r.get("tweet_id")) not in replacement_keys]
-        # Keep the latest reviewed decision per account/tweet.
-        decisions = list({(r["account"], r["tweet_id"]): r for r in decisions}.values())
-    merged = existing + all_new
-    merged.sort(key=lambda r: r.get("timestamp") or "", reverse=True)
-    if args.dry_run:
-        out = f"/tmp/pilot_dryrun_{args.source}.json"
-        write_json_atomic(out, all_new)
-        print(f"\n[DRY-RUN] no writes to trades.json / positions.json / state.")
-        print(f"[DRY-RUN] would add {len(all_new)} signals; "
-              f"would-be signals dumped to {out}")
-    else:
-        write_json_atomic(TRADES_FILE, merged)    # atomic: temp + os.replace
-        reconcile(TRADES_FILE, POSITIONS_FILE)    # fold events -> positions.json
-        os.makedirs(os.path.dirname(decisions_file), exist_ok=True)
-        write_json_atomic(decisions_file, decisions)
-        if not args.backfill:
-            # Heartbeat: the dashboard reads this to flag stale data if a cron
-            # run stops succeeding.
-            if not interp.errors and not fetch_failures:
-                state["_last_run"] = datetime.now(timezone.utc).isoformat()
-            write_json_atomic(STATE_FILE, state)
-
-    # summary
-    by = {}
-    for s in all_new:
-        key = (s["account"], s["signal_type"])
-        by[key] = by.get(key, 0) + 1
-    print(f"\nNew signals: {len(all_new)} (stored total: {len(merged)})")
-    for (acct, st), c in sorted(by.items()):
-        print(f"  {acct:16} {st:9} {c}")
-    print(f"\nreply-skipped (no API call): {total_skipped}  |  "
-          f"reply-sell-candidate (sent to LLM): {total_sell_cand}")
-    print(f"LLM text calls (Gemini {MODEL}): {interp.calls}  "
-          f"(input {interp.input_tokens} tok, output {interp.output_tokens} tok)"
-          f"  ${interp.cost():.4f}")
-    print(f"LLM vision calls (Gemini): {interp.vision_calls}  "
-          f"(input {interp.vision_input_tokens} tok, "
-          f"output {interp.vision_output_tokens} tok)  ${interp.vision_cost():.4f}")
-    print(f"LLM cost this run: "
-          f"${interp.cost() + interp.vision_cost():.4f}")
-    getxapi_usd = 0.0
-    if not args.backfill:
-        if args.source == "getxapi":
-            getxapi_usd = total_calls * GETXAPI_COST_PER_CALL
-            print(f"GetXAPI [{args.source}]: {total_reads} tweets in "
-                  f"{total_calls} calls (${getxapi_usd:.4f})")
-        else:
-            print(f"Twitter reads [{args.source}]: {total_reads}  "
-                  f"(${total_reads * TWITTER_COST_PER_TWEET:.4f})")
-
-    # Append per-run cost telemetry (skip dry-run writes and runs that spent
-    # nothing).
-    if not args.dry_run and (interp.calls or interp.vision_calls or getxapi_usd):
-        log_cost(interp, getxapi_usd)
-    if interp.vision_errors:
-        print(f"WARNING: {interp.vision_errors} optional chart pass(es) failed; text signals retained",
-              file=sys.stderr)
-    if interp.errors or interp.vision_errors or fetch_failures:
-        sys.exit(1)
-
-
-def log_cost(interp, getxapi_usd=0.0):
-    """Append this run's token usage + cost to data/cost_log.json (shared with
-    the digests, see cost_log.py). Telemetry only: a write failure prints a
-    warning but never breaks the run."""
-    cost_log.append_run(
-        "monitor", interp.cost() + interp.vision_cost(), getxapi_usd,
-        path=COST_LOG_FILE,
-        extract_input_tok=interp.input_tokens,
-        extract_output_tok=interp.output_tokens,
-        vision_input_tok=interp.vision_input_tokens,
-        vision_output_tok=interp.vision_output_tokens)
-
-
-
-
-
-
 class GeminiTally:
     """Run-wide tally of Gemini calls that succeeded vs ones whose APIError was
     swallowed at the call site.
@@ -1475,6 +335,8 @@ class GeminiTally:
 # that the rate means something -- otherwise one flaky call on a 1-post night
 # triggers a warning at 100%.
 OUTAGE_MIN_CALLS = 5
+
+
 OUTAGE_FAIL_RATE = 0.8
 
 
@@ -1493,48 +355,3 @@ def report_gemini_outage(tally, who):
            f"-- check GOOGLE_API_KEY/quota")
     print(f"ERROR: {msg}", file=sys.stderr)
     return True
-
-
-def _report_staleness(state):
-    """If the last successful run is older than STALE_WARN_HOURS, log a warning.
-    Runs at the start of each live run, so missed/failed prior runs are caught."""
-    last = state.get("_last_run")
-    if not last:
-        return
-    try:
-        age_h = (datetime.now(timezone.utc)
-                 - datetime.fromisoformat(last)).total_seconds() / 3600
-    except (ValueError, TypeError):
-        return
-    if age_h > STALE_WARN_HOURS:
-        print(f"WARNING: data stale — last successful run {age_h:.0f}h ago "
-              f"(>{STALE_WARN_HOURS}h)", file=sys.stderr)
-
-
-def _log_failure(exc):
-    """Append a FAILED entry with full traceback to monitor.log."""
-    ts = datetime.now(timezone.utc).isoformat()
-    try:
-        with open(MONITOR_LOG, "a") as f:
-            f.write(f"\n===== FAILED {ts} =====\n")
-            f.write("".join(
-                traceback.format_exception(type(exc), exc, exc.__traceback__)))
-            f.write("=====================\n")
-    except OSError:
-        pass
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except (SystemExit, KeyboardInterrupt):
-        # Clean operator exits, NOT failures: argparse --help / usage errors raise
-        # SystemExit, and Ctrl-C raises KeyboardInterrupt. Neither should write a
-        # FAILED block — just propagate the exit code.
-        raise
-    except BaseException as exc:   # log anything else, then surface a non-zero exit
-        if "--dry-run" not in sys.argv:
-            _log_failure(exc)
-        print(f"monitor.py FAILED: {exc!r} "
-              f"(traceback appended to {MONITOR_LOG})", file=sys.stderr)
-        sys.exit(1)

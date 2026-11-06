@@ -40,18 +40,9 @@ def no_external_side_effects(monkeypatch):
     monkeypatch.setattr(monitor, 'load_env', lambda _: None)
 
 
-@pytest.mark.parametrize('bad', [None, [], {}, {'action': 'none'}, float('nan')])
-def test_invalid_signal_responses_are_rejected(bad):
-    assert parse_response(response(bad), monitor.SIGNAL_SCHEMA) is None
-
-
 def test_nested_schema_and_nonfinite_numbers():
-    valid = schema_value(monitor.SIGNAL_SCHEMA)
-    assert parse_response(response(valid), monitor.SIGNAL_SCHEMA) == valid
-    for bad_price in [True, '100', float('inf'), float('nan')]:
-        valid['entry_price'] = bad_price
-        assert parse_response(response(valid), monitor.SIGNAL_SCHEMA) is None
     valid = schema_value(yt.ANALYSIS_SCHEMA)
+    assert parse_response(response(valid), yt.ANALYSIS_SCHEMA) == valid
     valid['top_themes'] = [42]
     assert parse_response(response(valid), yt.ANALYSIS_SCHEMA) is None
 
@@ -79,55 +70,6 @@ def test_missing_ledger_and_lock_exclusion(tmp_path):
                 pytest.fail('Two writers entered')
     with ledger_lock(path):
         pass
-
-
-def test_monitor_retries_saved_payload_after_it_leaves_feed(tmp_path, monkeypatch):
-    trades = tmp_path / 'trades.json'
-    state = tmp_path / 'state.json'
-    positions = tmp_path / 'positions.json'
-    monkeypatch.setattr(monitor, 'TRADES_FILE', str(trades))
-    monkeypatch.setattr(monitor, 'STATE_FILE', str(state))
-    monkeypatch.setattr(monitor, 'POSITIONS_FILE', str(positions))
-    monkeypatch.setattr(monitor, 'log_cost', lambda *a: None)
-    monkeypatch.setenv('GOOGLE_API_KEY', 'test')
-    monkeypatch.setenv('GETXAPI_KEY', 'test')
-    monkeypatch.setattr(monitor, '_report_staleness', lambda _: None)
-    monkeypatch.setattr(monitor.sys, 'argv', ['monitor.py', '--account', 'IncomeSharks'])
-    state.write_text(json.dumps({'IncomeSharks': {'newest_id': '10'}, '_last_run': 'old'}))
-    failed = {'id': '11', 'text': 'Bought $BTC at $100', 'created_at': '2026-09-01T00:00:00Z'}
-    newer = {'id': '12', 'text': 'Nothing', 'created_at': '2026-09-02T00:00:00Z'}
-    fetch = Mock(side_effect=[([newer, failed], 1), ([], 1)])
-    monkeypatch.setattr(monitor, 'fetch_getxapi', fetch)
-    valid = schema_value(monitor.SIGNAL_SCHEMA)
-    valid.update(action='buy', ticker='BTC', asset_type='crypto', entry_price=100,
-                 confidence='high', trade_date='2026-09-01', event_kind='entry',
-                 execution_evidence='Bought $BTC at $100')
-    valid['level_evidence']['entry_price'] = 'Bought $BTC at $100'
-    neutral = dict(valid, action='none')
-    client = SimpleNamespace(models=SimpleNamespace(generate_content=Mock(
-        side_effect=[response(neutral), response(None), response(valid)])))
-    monkeypatch.setattr(monitor.genai, 'Client', lambda: client)
-    with pytest.raises(SystemExit) as exc:
-        monitor.main()
-    assert exc.value.code == 1
-    saved = json.loads(state.read_text())
-    assert saved['IncomeSharks']['newest_id'] == '12'
-    assert saved['IncomeSharks']['pending_tweets'] == [failed]
-    assert saved['_last_run'] == 'old'
-    assert json.loads(trades.read_text()) == []
-    monitor.main()
-    saved = json.loads(state.read_text())
-    assert saved['IncomeSharks']['pending_tweets'] == []
-    assert saved['_last_run'] != 'old'
-    assert [r['tweet_id'] for r in json.loads(trades.read_text())] == ['11']
-    assert json.loads(positions.read_text())[0]['ticker'] == 'BTC'
-    assert client.models.generate_content.call_count == 3
-
-
-def test_failed_text_does_not_pay_for_vision():
-    interp = SimpleNamespace(extract=Mock(return_value=None), extract_chart=Mock())
-    assert monitor.build_signal('IncomeSharks', {'text': '$BTC', 'media': ['photo']}, interp) is None
-    interp.extract_chart.assert_not_called()
 
 
 @pytest.mark.parametrize('module,registry,key,runner,date_field,id_field', [
@@ -220,10 +162,6 @@ def test_mangled_retry_and_give_up_remain_intact(monkeypatch, module, function, 
     assert client.models.generate_content.call_count == 3
 
 
-
-
-
-
 @pytest.mark.parametrize('url', ['http://127.0.0.1/image', 'file:///etc/passwd',
     'https://pbs.twimg.com.evil.test/image', 'https://user@pbs.twimg.com/image',
     'https://pbs.twimg.com:8080/image'])
@@ -236,12 +174,6 @@ def test_http_200_error_envelope_is_not_an_empty_timeline(payload):
     with pytest.raises(ValueError):
         monitor._tweet_page(payload)
     assert monitor._tweet_page({'tweets': []}) == []
-
-
-def test_backfill_missing_snapshot_is_not_empty_history(monkeypatch):
-    monkeypatch.setattr(monitor, 'RAW_FILES', {})
-    with pytest.raises(FileNotFoundError):
-        monitor.tweets_for_account('IncomeSharks', {}, True, 'getxapi')
 
 
 def test_media_query_mime_and_redirect_policy(monkeypatch):
@@ -280,34 +212,8 @@ def test_forecast_wrong_shape_is_preserved(tmp_path):
         assert path.read_text() == content
 
 
-def test_optional_chart_failure_keeps_text_signal():
-    valid = schema_value(monitor.SIGNAL_SCHEMA)
-    valid.update(action='sell', ticker='BTC', confidence='high', event_kind='exit', execution_evidence='Sold $BTC')
-    interp = SimpleNamespace(extract=Mock(return_value=valid), extract_chart=Mock(return_value=None))
-    signal = monitor.build_signal('IncomeSharks', {'id': '123', 'text': 'Sold $BTC', 'media': ['photo']}, interp)
-    assert signal['signal_type'] == 'sell'
-    assert signal['tickers'] == ['BTC']
-
-
-def test_incomplete_backfill_preserves_all_accounts(tmp_path, monkeypatch):
-    trades = tmp_path / 'trades.json'
-    original = [{'account': 'IncomeSharks', 'tweet_id': 'old', 'timestamp': '2026-01-01'}]
-    trades.write_text(json.dumps(original))
-    monkeypatch.setattr(monitor, 'TRADES_FILE', str(trades))
-    monkeypatch.setattr(monitor, 'POSITIONS_FILE', str(tmp_path / 'positions.json'))
-    monkeypatch.setattr(monitor, 'STATE_FILE', str(tmp_path / 'state.json'))
-    monkeypatch.setattr(monitor, 'ACCOUNTS', ['IncomeSharks', 'traderstewie'])
-    monkeypatch.setattr(monitor.sys, 'argv', ['monitor.py', '--backfill'])
-    monkeypatch.setenv('GOOGLE_API_KEY', 'test')
-    monkeypatch.setattr(monitor.genai, 'Client', lambda: object())
-    monkeypatch.setattr(monitor, 'tweets_for_account', Mock(side_effect=[([], 0, 0), FileNotFoundError('snapshot')]))
-    with pytest.raises(RuntimeError, match='Backfill incomplete'):
-        monitor.main()
-    assert json.loads(trades.read_text()) == original
-
-
 def test_nonfinite_write_does_not_replace_good_ledger(tmp_path):
-    from reconcile import write_json_atomic
+    from storage import write_json_atomic
     path = tmp_path / 'ledger.json'
     path.write_text('[1]')
     with pytest.raises(ValueError):
@@ -328,12 +234,3 @@ def test_html_entities_and_corruption_detectors():
         assert monitor._looks_mangled(text)
 
 
-def test_fetch_getxapi_max_pages_limits_calls(monkeypatch):
-    pages = iter([{'tweets': [{'id': '3', 'createdAt': 'Wed Sep 02 00:00:00 +0000 2026'}], 'has_more': True, 'next_cursor': 'a'},
-                  {'tweets': [{'id': '2', 'createdAt': 'Wed Sep 02 00:00:00 +0000 2026'}], 'has_more': True, 'next_cursor': 'b'},
-                  {'tweets': [{'id': '1', 'createdAt': 'Wed Sep 02 00:00:00 +0000 2026'}], 'has_more': False}])
-    monkeypatch.setattr(monitor, 'getxapi_get_retry', lambda _: next(pages))
-    raw, calls = monitor.fetch_getxapi('IncomeSharks', max_pages=1)
-    assert calls == 1 and [x['id'] for x in raw] == ['3']
-    raw, calls = monitor.fetch_getxapi('IncomeSharks')
-    assert calls == 2 and [x['id'] for x in raw] == ['2', '1']

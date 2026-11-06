@@ -17,8 +17,7 @@ def test_non_trading_tabs_do_not_warm_prices(monkeypatch, tab):
     def forbidden(*args, **kwargs):
         raise AssertionError('Irrelevant tab requested price data')
     monkeypatch.setattr(dash, 'warm_prices', forbidden)
-    monkeypatch.setattr(dash, 'load_positions', forbidden)
-    assert len(dash.refresh_influencers(0, tab)) == 16
+    assert len(dash.refresh_influencers(0, tab)) == 12
 
 
 def test_intraday_close_expires_instead_of_being_cached_forever(monkeypatch):
@@ -44,15 +43,15 @@ def test_retired_feature_absent_and_remaining_tabs_switch():
     with dash.app.server.test_client() as client:
         for url in ['/_dash-layout', '/_dash-dependencies']:
             assert 'reddit' not in client.get(url).get_data(as_text=True).lower()
-    tabs = ['IncomeSharks', 'traderstewie', 'BenCowen', 'JesseOlson',
+    tabs = ['BenCowen', 'JesseOlson',
             'KiYoungJu', 'JoaoWedson', 'DorkChicken', 'DaanCrypto', 'DonAlt',
             'CowenX', 'Glassnode', 'Truecrypto', 'GeoffKendrick', 'MakeItCount']
     for tab in tabs:
         result = dash.switch_influencer_subtab(tab)
-        assert len(result) == 15
-        assert sum(style['display'] == 'block' for style in result[:-2]) == 1
+        assert len(result) == 12
+        assert sum(style['display'] == 'block' for style in result) == 1
     assert all(style['display'] == 'none'
-               for style in dash.switch_influencer_subtab('Consensus')[:-2])
+               for style in dash.switch_influencer_subtab('Consensus'))
 
 
 def test_youtube_rejects_non_web_href():
@@ -102,9 +101,9 @@ def test_consensus_sources_open_their_feed_view(monkeypatch):
            if isinstance(c, dash.html.Button)]
     assert sorted(i['view'] for i in ids) == sorted(targets)
     for target in targets:
-        styles = dash.switch_influencer_subtab(target)[:-2]
+        styles = dash.switch_influencer_subtab(target)
         assert sum(style['display'] == 'block' for style in styles) == 1
-        assert any(out for out in dash.refresh_influencers(0, target)[4:])
+        assert any(out for out in dash.refresh_influencers(0, target))
         back = dash.refresh_consensus(0, target)
         assert [c.id for c in _walk(back[0]) if isinstance(c, dash.html.Button)] == \
             [{'type': 'open-view', 'view': 'Consensus'}]
@@ -122,54 +121,13 @@ def test_twitter_section_shows_two_weeks_but_at_least_limit(monkeypatch):
     assert len(dash.twitter_section(slow)) == 8
 
 
-@pytest.mark.parametrize('age_h, content, expected', [
-    (2, None, None), (20, None, 20), (None, '{}', 'no data')])
-def test_monitor_stale_only_flags_failures(monkeypatch, tmp_path, age_h, content, expected):
-    state = tmp_path / 'state.json'
-    if content is None:
-        last = dash.datetime.now(dash.timezone.utc) - dash.timedelta(hours=age_h)
-        content = '{"_last_run": "%s"}' % last.isoformat()
-    state.write_text(content)
-    monkeypatch.setattr(dash, 'STATE_FILE', str(state))
-    got = dash._monitor_stale()
-    assert got == expected if not isinstance(expected, int) else round(got) == expected
-
-
-def test_yahoo_symbol_aliases_and_non_tickers():
+def test_yahoo_symbol_aliases():
     assert dash._yf_symbol('SKY', 'crypto') == 'SKY33038-USD'     # SKY-USD is Skycoin
     assert dash._yf_symbol('STRK', 'crypto') == 'STRK22691-USD'
     assert dash._yf_symbol('STRK', 'stock') == 'STRK'
     assert dash._yf_symbol('BTC', 'crypto') == 'BTC-USD'
     assert dash._yf_symbol('$COMPQ', 'unknown') == '^IXIC'
     assert dash._yf_symbol('RUT', 'stock') == '^RUT'
-    positions = [{'account': 'IncomeSharks', 'ticker': t} for t in ('none', 'NYMO', 'HOOD')]
-    assert [p['ticker'] for p in dash.influencer_positions(positions)] == ['HOOD']
-
-
-def test_verified_fill_is_not_replaced_by_an_arbitrary_close(monkeypatch):
-    import pandas as pd
-    hist = pd.DataFrame([{'Open': 85, 'High': 90, 'Low': 80, 'Close': 84.84}], index=['2026-05-29'])
-    monkeypatch.setattr(dash, 'get_ohlc', lambda *a, **k: hist)
-    recap = {'ticker': 'HOOD', 'asset_type': 'stock', 'opened_at': '2026-05-28T22:00:00Z',
-             'entry_price': 8}
-    assert dash._entry_for(recap) == (8, False)
-    assert dash._entry_for(dict(recap, entry_price=80)) == (80, False)
-    assert dash._entry_for(dict(recap, entry_price=None)) == (85, True)
-
-
-def test_bad_levels_exclude_an_open_call_but_a_closed_one_still_counts(monkeypatch):
-    import pandas as pd
-    hist = pd.DataFrame([{'High': 250, 'Low': 220}], index=['2026-08-28'])
-    monkeypatch.setattr(dash, 'get_ohlc', lambda *a, **k: hist)
-    monkeypatch.setattr(dash, '_entry_for', lambda *a, **k: (228.0, True))
-    monkeypatch.setattr(dash, 'get_hist_close', lambda *a, **k: 250.0)
-    monkeypatch.setattr(dash, 'get_price', lambda *a: 250.0)
-    open_call = dict(account='IncomeSharks', ticker='CRWD', status='open', side='long',
-                     trade_date='2026-08-27', target=31.0, entry_status='confirmed', asset_type='stock')
-    closed = dict(open_call, status='closed', closed_at='2026-09-01', exit_fills=[{'price': 250, 'fraction': 1}])
-    res = dash.influencer_resolutions([open_call, closed])
-    assert [r['status'] for _, r in res] == [dash.resolver.INCONSISTENT,
-                                             dash.resolver.CLOSED_WIN]
 
 
 def test_missing_past_close_is_not_refetched_every_pass(monkeypatch):
@@ -288,29 +246,11 @@ def test_data_version_changes_only_with_the_data(monkeypatch, tmp_path):
     ledger = tmp_path / 'x_summaries.json'
     ledger.write_text('[]')
     monkeypatch.setattr(dash, 'DATA_DIR', str(tmp_path))
-    monkeypatch.setattr(dash, 'TRADES_FILE', str(tmp_path / 'absent.json'))
-    monkeypatch.setattr(dash, 'POSITIONS_FILE', str(tmp_path / 'absent.json'))
     v1 = dash._data_version()
     assert dash.refresh_data_version(1, v1) is dash.no_update
     mtime = dash.os.stat(ledger).st_mtime_ns
     dash.os.utime(ledger, ns=(mtime, mtime + 10**9))
     assert dash.refresh_data_version(2, v1) not in (v1, dash.no_update)
-
-
-def test_setups_list_newest_first_with_date_and_safe_link():
-    positions = [
-        dict(account='IncomeSharks', ticker='ETH', status='setup', side='long',
-             signals=[{'timestamp': '2026-09-10T10:00:00+00:00',
-                       'url': 'https://x.com/a/status/1'}]),
-        dict(account='IncomeSharks', ticker='ETH', status='setup', side='long',
-             signals=[{'timestamp': '2026-09-25T10:00:00+00:00',
-                       'url': 'javascript:alert(1)'}]),
-        dict(account='traderstewie', ticker='AXTI', status='setup', signals=[]),
-    ]
-    text = str(dash._setups_block(positions, 'IncomeSharks'))
-    assert 'All ideas and unclear posts (2)' in text
-    assert text.index('2026-09-25') < text.index('2026-09-10')
-    assert 'javascript' not in text and 'https://x.com/a/status/1' in text
 
 
 def _scored(net, bench=None, day='2026-09-01'):
@@ -320,50 +260,3 @@ def _scored(net, bench=None, day='2026-09-01'):
     if bench is not None:
         r['benchmark_pct'] = bench
     return r
-
-
-def test_copy_stats_show_the_edge_and_the_mean_without_outliers():
-    replays = {'publication': [({}, _scored(v, 1.0)) for v in (60.0, 2.0, -1.0, -1.0, 0.0)]
-               + [({}, {'status': 'pending', 'benchmark_symbol': 'QQQ'})]}
-    s = dash._copy_stats(replays)
-    assert round(s['mean_net_pct'], 2) == 12.0 and round(s['excess_pp'], 2) == 11.0
-    assert round(s['mean_wo_best2'], 2) == round(-2 / 3, 2)     # 60 and 2 dropped
-    assert dash._benchmark_label(replays) == 'QQQ'
-
-
-def test_signals_hide_commentary_unless_asked():
-    events = [dict(account='traderstewie', event_kind=k, timestamp=f'2026-09-0{i}T12:00:00Z',
-                   tickers=['MU'], text='$MU https://t.co/x', target=110, tp1=110, tp2=120)
-              for i, k in enumerate(('setup', 'commentary'), 1)]
-    rows = dash.influencer_signals_data(events, account='traderstewie')
-    assert [r['event_kind'] for r in rows] == ['setup']
-    assert rows[0]['targets'] == '$110.00 / $120.00' and 'https' not in rows[0]['post']
-    assert len(dash.influencer_signals_data(events, account='traderstewie',
-                                            show_commentary=True)) == 2
-
-
-def test_reported_trades_price_only_while_held(monkeypatch):
-    monkeypatch.setattr(dash, '_entry_for', lambda *a, **k: (100.0, True))
-    monkeypatch.setattr(dash, 'get_price', lambda *a: 150.0)
-    held = dict(account='traderstewie', event_kind='holding', tickers=['MU'], side='long',
-                asset_type='stock', tweet_id='1', timestamp='2026-03-02T23:00:00Z')
-    exit_ = dict(held, event_kind='exit', tweet_id='2', timestamp='2026-03-03T15:00:00Z')
-    lone = dict(held, event_kind='trim', tickers=['TXG'], tweet_id='3')
-    cycle = dict(ticker='MU', cycle_id='c', status='closed', closed_at='2026-03-03T15:00:00Z',
-                 signals=[{'tweet_id': '1'}, {'tweet_id': '2'}])
-    rows = dash._reported_rows([held, exit_, lone], [cycle], 'traderstewie', [])
-    by = {(r['ticker'], r['kind']): r for r in rows}
-    assert by[('MU', 'holding')]['ret'] is None          # closed: the later move is not his
-    assert by[('MU', 'exit')]['status'][0] == 'closed 2026-03-03'
-    assert by[('TXG', 'trim')]['status'][0] == 'no entry on record'
-    cycle['status'] = 'open'
-    rows = dash._reported_rows([held], [cycle], 'traderstewie', [])
-    assert rows[0]['ret'] == 50.0 and rows[0]['status'][0] == 'still open'
-
-
-def test_copy_test_ignores_rescan_pickup_times(monkeypatch):
-    monkeypatch.setattr(dash, 'get_price', lambda *a: None)
-    replays = {'publication': [({'ticker': 'MU'}, _scored(1.0, 0.5))], 'duplicates': 0,
-               'latencies': [3.0, 11_000.0]}
-    text = str(dash.copy_test_section(replays, [], 'traderstewie'))
-    assert 'median 3 min' in text and '1 older ones were stamped by a later re-scan' in text

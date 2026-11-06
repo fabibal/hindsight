@@ -27,7 +27,7 @@ MAX_PER_SOURCE caps the file at ~1.6 MB no matter how long it runs.
 import json
 import os
 
-from reconcile import write_json_atomic
+from storage import write_json_atomic
 from storage import load_ledger, ledger_lock
 
 HOME = os.path.dirname(os.path.abspath(__file__))

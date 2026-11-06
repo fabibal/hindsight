@@ -1,10 +1,11 @@
 # Hindsight
 
-**An LLM-driven trade-call tracker and market-research aggregator.** It watches
-finance influencers on X (Twitter), uses large language models to extract
-structured trade signals from their posts, tracks how those calls actually
-resolve against real prices, and serves a live dashboard alongside
-analysis-only research digests of on-chain and macro analysts on X and YouTube.
+**An LLM-driven market-research aggregator.** It reads analyst posts on X
+(Twitter) and YouTube with large language models, keeps a rolling "current view"
+per analyst, and serves a live dashboard with a Consensus panel of what each of
+them expects. (Earlier versions also extracted trade signals from finance
+influencers and resolved them against real prices; that part was retired in
+November 2026.)
 
 > ⚠️ **Tracking and research only — no real money, no orders are ever placed,
 > not financial advice.** See the [Disclaimer](#disclaimer).
@@ -14,18 +15,18 @@ analysis-only research digests of on-chain and macro analysts on X and YouTube.
 ## Why I built it
 
 This started as a personal experiment: *can an LLM reliably turn messy,
-free-form social-media posts into structured trade signals — and do the people
-posting them actually call the market as well as they seem to?*
+free-form social-media posts into structured data - and do the people posting
+them actually call the market as well as they seem to?*
 
 It became a sandbox for learning a lot of things end to end:
 
-- **LLM structured extraction** — schema-constrained prompting, vision models for
+- **LLM structured extraction** - schema-constrained prompting, vision models for
   reading chart screenshots, native video reading, cost control via
   deduplication and pre-LLM gating.
-- **Signal evaluation** — resolving each call against real price history
-  (target hit / stopped out / expired) instead of taking claimed track records
-  at face value.
-- **Production-style ops** — Dockerized services, cron pipelines, health checks,
+- **Signal evaluation** - resolving claims against real price history instead of
+  taking claimed track records at face value (the retired trade-call phase, and
+  later one-off studies such as the TechCharts chart study in `docs/`).
+- **Production-style ops** - Dockerized services, cron pipelines, health checks,
   outage alerting, and a self-hosted dashboard.
 
 Nothing here places orders. The goal was to learn and to satisfy my own
@@ -35,25 +36,7 @@ curiosity, not to give or follow investment advice.
 
 ## Features
 
-**Trade-call tracking** (two public human trade-call accounts on X)
-
-- **Source-grounded signal types** - distinguishes prospective setups, explicit
-  execution/holding disclosures, recaps and commentary; captures multiple assets
-  and own-thread updates without inventing fills or inheriting earlier prices.
-  Ambiguous records stay in a review state instead of becoming trades.
-- **LLM signal extraction** - each tweet is read by Google Gemini under a strict
-  JSON schema, yielding ticker, direction, sizing, entry, stop/target, thesis,
-  and the *actual trade date* (posts often recap older trades).
-- **Vision pass** - posts with chart images get a second vision-model pass that
-  fills gaps the text did not cover; text always wins, and a chart alone can
-  create a setup but never a confirmed holding.
-- **Honest evaluation** - each call is resolved against real daily price history
-  (target hit / stopped out / expired). Calls whose levels were already invalid
-  when made are excluded from win-rate statistics. The headline number is a
-  five-session next-open "copy test" replay with matched QQQ/BTC benchmarks and
-  a stated 20bp round-trip cost assumption; barrier success is secondary.
-
-**Analysis-only research digests** (never traded)
+**Analysis-only research digests**
 
 - **X feeds** - eight per-post feeds (on-chain, macro and technical analysts),
   each with its own ledger and persona prompt, plus an optional chart-vision
@@ -75,7 +58,8 @@ curiosity, not to give or follow investment advice.
 **Dashboard and operations**
 
 - **Live dashboard** - a dark-themed Dash app: one flat tab bar (Consensus
-  landing page, one tab per trade-call account, forecast table), a sticky
+  landing page, forecast table; every analyst's card view opens from its
+  Consensus row), a sticky
   status bar (API credit runway, LLM spend across all pipelines, price
   freshness), "new since your last visit" badges, and a background cache warmer
   that refreshes data ahead of expiry so page loads never fetch.
@@ -83,16 +67,16 @@ curiosity, not to give or follow investment advice.
   acknowledged only after outputs commit, so a crash repeats work rather than
   losing it. Total-LLM-outage detection, corrupted-text detection with retry,
   and per-run cost logging are built in.
-- **Cost-aware by design** - high-water-mark deduplication, pre-LLM gating,
+- **Cost-aware by design** - ledger deduplication, pre-LLM gating,
   cheap real-time Gemini calls, and a cheaper third-party tweet source keep the
   monthly LLM/API spend in the low-single-digit-dollar range.
 
 > **Note:** earlier versions of this project also tracked AI-run portfolio bots
-> and mirrored their trades to an Interactive Brokers paper account. Both were
-> retired in August 2026 (the upstream accounts went dead), and the strategy
-> mining and outbound-notification features were retired in September 2026;
-> the code lives on in git history. Everything monitored today is a human
-> trade-call or analysis-only account.
+> and mirrored their trades to an Interactive Brokers paper account (retired
+> August 2026), mined strategies and sent notifications (retired September
+> 2026), and extracted trade calls from two human trade-call accounts
+> (retired November 2026). The code lives on in git history. Everything
+> monitored today is analysis-only.
 
 ---
 
@@ -100,35 +84,29 @@ curiosity, not to give or follow investment advice.
 
 ```mermaid
 flowchart TD
-    X[X / Twitter API] --> M[monitor.py<br/>gates + LLM extraction]
-    M -->|1 row per signal tweet| T[(trades.json<br/>event log)]
-    T --> R[reconcile.py]
-    R -->|account, ticker -> status| P[(positions.json)]
-    P --> D[dashboard.py<br/>Dash app]
-    yf[yfinance prices] --> D
     XD[X analysis feeds] --> TD[twitter_digest.py]
     YT[YouTube RSS] --> YM[youtube_monitor.py]
-    TD --> S[(per-feed summaries<br/>+ current views)]
+    TD --> S[(per-feed summaries<br/>+ current views<br/>+ sentiment history)]
     YM --> S
-    S --> D
+    S --> D[dashboard.py<br/>Dash app]
+    yf[yfinance prices] --> D
 ```
 
 **Pipeline in words:**
 
-1. `monitor.py` fetches new tweets, applies pre-LLM gates (retweet/reply
-   dedup, language and content filters, high-water-mark skipping), then runs
-   text (and optional vision) extraction into a strict schema.
-2. Each extracted signal is appended to `trades.json` (an append-only event log).
-3. `reconcile.py` folds the event log into `positions.json` — a current view
-   keyed by `(account, ticker)` with open/closed status and sizing; earlier
-   trading cycles of the same ticker are retained under stable cycle IDs.
-4. `resolver.py` / `evaluation.py` resolve calls against daily price history
-   and run the five-session replay; `dashboard.py` renders the results and the
-   research digests.
+1. `twitter_digest.py` and `youtube_monitor.py` fetch new posts / videos, apply
+   pre-LLM gates (retweet and reply filters, language and content filters) and
+   read each item with Gemini under a strict JSON schema (plus an optional
+   chart-vision pass; videos are read natively).
+2. Each feed or channel keeps its own append-only ledger, which doubles as its
+   deduplication set, so re-runs are idempotent. Inputs are persisted before
+   analysis and acknowledged only after the outputs commit.
+3. Once per run, a rolling "current view" is synthesised per analyst and
+   appended to a history log; `dashboard.py` renders the cards, the Consensus
+   panel and the forecast table.
 
-Separate, **never-traded** pipelines (`youtube_monitor.py`, `twitter_digest.py`) produce analysis-only research summaries shown in the
-dashboard. Each keeps its own append-only ledger, which doubles as its
-deduplication set, so re-runs are idempotent.
+All of these pipelines are **never-traded**: they only produce analysis-only
+research summaries.
 
 MakeItCount's chapter and frame enrichment requires `yt-dlp` in the host
 environment and FFmpeg on `PATH`. If that enrichment is unavailable, the
@@ -170,11 +148,7 @@ Add images here, e.g.:
 ## Project layout (high level)
 
 ```
-monitor.py             # ingestion + LLM extraction pipeline
-signal_semantics.py    # conservative event classification (no I/O, no model calls)
-reconcile.py           # event log -> current positions
-resolver.py            # target/stop resolution for win-rate stats
-evaluation.py          # five-session next-open replay with explicit cost assumption
+monitor.py             # shared helpers for the digests (X fetch, Gemini constants, outage tally)
 dashboard.py           # Dash web app
 twitter_digest.py      # analysis-only X research digests + forecast ledger
 youtube_monitor.py     # analysis-only YouTube research digests
@@ -182,13 +156,12 @@ video_frames.py        # YouTube chapter metadata + real frames (yt-dlp / FFmpeg
 digest_state.py        # rolling "current view" schema + recovery
 sentiment_history.py   # append-only log of every "current view" synthesis
 ingestion_queue.py     # durable input queue (commit output before acknowledging)
-storage.py             # strict ledger reads + advisory file locks
+storage.py             # strict ledger reads, advisory file locks, atomic JSON writes
 llm_support.py         # JSON-schema validation + usage counting for LLM calls
 cost_log.py            # per-run spend telemetry
-accounts.py            # monitored-account registry
 assets/                # dashboard front-end script
-scripts/               # model-deprecation check, content check, history review, backup
-tests/                 # unit tests (reconciliation, resolution, recovery, dashboard)
+scripts/               # model-deprecation check, dashboard content check, backup
+tests/                 # unit tests (recovery, ingestion queue, digests, dashboard)
 docs/                  # audits and reviews (see below)
 ```
 
@@ -203,7 +176,9 @@ the event/price evidence rules, own-thread handling, historical review,
 15-minute market-hours monitoring and the dashboard's replay assumptions.
 
 Further write-ups: the [copy-trading review](docs/copy_trading_review_2026-10-02.md)
-(whether following the monitored calls would have paid; in Hungarian) and the
+(whether following the then-monitored calls would have paid; in Hungarian), the
+[TechCharts chart study](docs/techcharts_chart_study_2026-11-06.md) (grading an
+analyst's chart posts against real prices; in Hungarian) and the
 [model review](docs/model_review_2026-09-30.md) (why the current Gemini models
 were kept after side-by-side tests on real inputs).
 
@@ -211,7 +186,8 @@ were kept after side-by-side tests on real inputs).
 
 The short version, with the evidence in [`docs/`](docs/):
 
-- Claimed track records do not survive resolution against real prices. Some
+- Claimed track records do not survive resolution against real prices (the
+  retired trade-call phase, and the later chart study). Some
   "calls" had a target or stop already past the entry when posted, and recaps of
   old trades look like fresh signals until the extraction is grounded in the
   post's own text and trade date.
@@ -254,8 +230,8 @@ Guidelines:
 
 - **All secrets load from environment variables / `.env`** (which is
   git-ignored). Never hardcode them — reference `os.environ[...]` instead.
-- **Runtime data stays out of git** — `positions.json`, `trades.json`, `data/`,
-  `tweets_*.json`, logs, and state files are already git-ignored.
+- **Runtime data stays out of git** — `data/`, logs and state files are
+  already git-ignored.
 - **Review every diff before committing.** If a secret is ever committed, treat
   it as compromised: rotate it immediately and scrub it from git history.
 

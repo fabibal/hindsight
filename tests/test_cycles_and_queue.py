@@ -2,60 +2,11 @@ import json
 from dataclasses import replace
 from types import SimpleNamespace
 
-import pandas as pd
 import pytest
 
-import reconcile
-import resolver
 import twitter_digest as tw
 import youtube_monitor as yt
 from ingestion_queue import PendingInputs
-
-
-def event(id, action, **kwargs):
-    default = 'Covered $TEST' if kwargs.get('side') == 'short' and kwargs.get('position_action') == 'close' else 'Shorted $TEST' if kwargs.get('side') == 'short' else {'buy': 'Bought $TEST', 'sell': 'Sold $TEST', 'position': 'I am holding $TEST'}[action]
-    kwargs.setdefault('text', default)
-    return dict(account='traderstewie', tickers=['TEST'], portfolio=None,
-                tweet_id=id, timestamp=f'2026-01-{id.zfill(2)}T12:00:00Z',
-                signal_type=action, confidence='high', **kwargs)
-
-
-def fold(tmp_path, events):
-    src, dst = tmp_path/'trades.json', tmp_path/'positions.json'
-    src.write_text(json.dumps(events))
-    return reconcile.reconcile(src, dst)
-
-
-def test_reopen_retains_closed_cycle_and_is_repeatable(tmp_path):
-    events = [event('1', 'buy', entry_price=100, stop_loss=90),
-              event('2', 'sell'), event('3', 'buy', entry_price=120)]
-    rows = fold(tmp_path, events)
-    assert rows == fold(tmp_path, events)
-    p = rows[0]
-    old, = p['prior_cycles']
-    assert old['status'] == 'closed' and old['entry_price'] == 100
-    assert old['stop_loss'] == 90 and len(old['signals']) == 2
-    assert p['entry_price'] == 120 and p['stop_loss'] is None
-    assert len(p['signals']) == 1 and old['cycle_id'] != p['cycle_id']
-
-
-def test_short_open_and_cover_do_not_close_long(tmp_path):
-    rows = fold(tmp_path, [event('1', 'buy', entry_price=100),
-        event('2', 'sell', side='short', position_action='open', entry_status='confirmed', entry_price=100),
-        event('3', 'buy', side='short', position_action='close', entry_status='confirmed')])
-    by_side = {p['side']: p for p in rows}
-    assert by_side['long']['status'] == 'open'
-    assert by_side['short']['status'] == 'closed'
-    assert resolver.return_pct(by_side['short'], 100, 80) == 20
-    assert resolver.resolve_closed(by_side['short'], 100, 80, '2026-01-03')['status'] == resolver.CLOSED_WIN
-
-
-def test_setup_cannot_close_holding_and_is_not_resolved(tmp_path):
-    rows = fold(tmp_path, [event('1', 'buy'), event('2', 'sell',
-                       text='Watching a potential SHORT setup', stop_loss=52, target=37)])
-    assert sorted(p['status'] for p in rows) == ['open', 'setup']
-    setup = next(p for p in rows if p['status'] == 'setup')
-    assert resolver.resolve_position(setup, pd.DataFrame()) is None
 
 
 def test_queue_survives_restart_and_dry_run(tmp_path):
@@ -115,21 +66,6 @@ def test_x_failed_post_retried_after_leaving_window(tmp_path, monkeypatch):
     tw.run_feed(feed, None, args)
     assert calls == [[raw], [raw]]
     assert PendingInputs(feed.summaries_file, 'id').rows == {}
-
-
-def test_dashboard_scores_archived_cycles_and_excludes_setups(monkeypatch):
-    import dashboard as dash
-    old = dict(account='traderstewie', ticker='TEST', status='closed', opened_at='2026-01-01',
-               closed_at='2026-01-02', entry_price=100, side='long', entry_status='confirmed', asset_type='stock',
-               exit_fills=[{'price': 110, 'fraction': 1}])
-    current = dict(old, status='open', opened_at='2026-01-03', prior_cycles=[old])
-    setup = dict(old, status='setup', entry_status='setup')
-    monkeypatch.setattr(dash, 'get_ohlc', lambda *a, **k: None)
-    monkeypatch.setattr(dash, 'get_hist_close', lambda *a, **k: 110)
-    monkeypatch.setattr(dash, '_entry_for', lambda *a, **k: (100, False))
-    results = dash.influencer_resolutions([current, setup], account='traderstewie')
-    assert len(results) == 2
-    assert results[0][1]['status'] == resolver.CLOSED_WIN
 
 
 def test_rss_outage_still_processes_pending_and_reports_failure(tmp_path, monkeypatch):
