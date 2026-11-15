@@ -96,6 +96,7 @@ from google.genai import types as genai_types
 from google.genai import errors as genai_errors
 
 import cost_log
+import trade_alerts
 from storage import write_json_atomic
 # Reuse monitor.py's tested helpers (env/json loaders, GetXAPI client + tweet
 # normalizer, the Gemini image-block fetch, local outage reporting) so this stays DRY
@@ -407,6 +408,10 @@ class Feed:
     # off-topic motivational/promo content _has_analyzable_content can't tell
     # apart from real market commentary since it has real text either way.
     require_market_signal: bool = False
+    # Joao-only: classify each post for the author's OWN long/short positions
+    # (trade_alerts.extract_events, a separate small Gemini call) and feed the
+    # Telegram alert queue. See trade_alerts.py.
+    trade_alerts: bool = False
 
     @property
     def is_search(self):
@@ -464,6 +469,7 @@ FEEDS = {f.key: f for f in [
         skip_langs=frozenset(),
         max_fetch=60,                    # ~6 posts/day -> ~10 days of headroom
         current_view_file=os.path.join(DATA_DIR, "joao_wedson_current_view.json"),
+        trade_alerts=True,
     ),
     Feed(
         key="dorkchicken",
@@ -1036,6 +1042,19 @@ def process(candidates, gemini_client, feed, allow_vision=True):
             print("    text analysis failed; skipping", file=sys.stderr)
             continue
 
+        trade = None
+        if feed.trade_alerts:
+            # A failed classification skips the post (it stays unseen and is
+            # retried next run) -- an alert must never be lost to a one-off API error.
+            trade = trade_alerts.extract_events(
+                gemini_client, text, date, model=MODEL, thinking=GEMINI_THINKING,
+                tally=LLM_TALLY, types=genai_types, errors=genai_errors)
+            if trade is None:
+                print("    trade-event classification failed; skipping", file=sys.stderr)
+                continue
+            total_in += trade[2]
+            total_out += trade[3]
+
         media = n.get("media") or []           # photo URLs (charts) on this post
         rec = {
             "tweet_id": tid,
@@ -1051,6 +1070,10 @@ def process(candidates, gemini_client, feed, allow_vision=True):
             "chart_summary": None,
             **analysis,
         }
+        if trade is not None:
+            rec["trade_events"] = trade[0]
+            if trade[1]:
+                rec["trade_events_rejected"] = trade[1]
         if feed.is_search:                     # who posted it + dedup fingerprint
             rec["author"] = author             # (the ledger's cross-run seen_sigs)
             rec["text_sig"] = _content_sig(text)
@@ -1590,6 +1613,26 @@ def run_forecast_feed(feed, gemini_client, args):
     print(f"Wrote {len(forecasts)} forecasts -> {feed.summaries_file}")
 
 
+def _try_dispatch(feed, records, args):
+    """Run the alert dispatch; return the exception (or None) instead of raising."""
+    try:
+        _dispatch_trade_alerts(feed, records, args)
+    except Exception as exc:                      # re-raised by the caller
+        traceback.print_exc()
+        return exc
+    return None
+
+
+def _dispatch_trade_alerts(feed, records, args):
+    """Joao-only: classify/queue/send Telegram alerts from the stored ledger.
+    No-op for other feeds and for --dry-run (trade_alerts.dispatch itself also
+    never sends for --force ids)."""
+    if not feed.trade_alerts:
+        return
+    trade_alerts.dispatch(records, dry_run=args.dry_run,
+                          force_ids={str(i) for i in (args.force or [])})
+
+
 @single_writer(lambda feed, gemini_client, args: feed.summaries_file)
 @report_discovery_errors
 def run_feed(feed, gemini_client, args):
@@ -1634,9 +1677,14 @@ def run_feed(feed, gemini_client, args):
     pending.add(candidates)
     if not candidates:
         print("No new posts to process.")
+        # Alerts first (pending sends must go out), but a failure there must not
+        # skip the current-view refresh -- and vice versa: re-raised afterwards.
+        alert_error = _try_dispatch(feed, summaries, args)
         if not args.dry_run:
             refresh_current_view(gemini_client, feed, summaries, _select_current_view_window, generate_current_view,
                                  GEMINI_INPUT_PER_1M, GEMINI_OUTPUT_PER_1M, RUN_COST)
+        if alert_error:
+            raise alert_error
         return
 
     print(f"Processing {len(candidates)} post(s)"
@@ -1651,6 +1699,7 @@ def run_feed(feed, gemini_client, args):
           f"Gemini tokens in={in_tok} out={out_tok} (${cost:.4f})")
 
     if not records:
+        _dispatch_trade_alerts(feed, summaries, args)
         return
     if args.dry_run:
         print("[dry-run] not writing; analysis below:")
@@ -1668,8 +1717,11 @@ def run_feed(feed, gemini_client, args):
     pending.acknowledge(by_id)
     print(f"Wrote {len(merged)} summaries -> {feed.summaries_file}")
 
+    alert_error = _try_dispatch(feed, merged, args)
     refresh_current_view(gemini_client, feed, merged, _select_current_view_window, generate_current_view,
                                  GEMINI_INPUT_PER_1M, GEMINI_OUTPUT_PER_1M, RUN_COST)
+    if alert_error:
+        raise alert_error
 
 
 def main():
