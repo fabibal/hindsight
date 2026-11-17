@@ -5,7 +5,8 @@
 per analyst, and serves a live dashboard with a Consensus panel of what each of
 them expects. (Earlier versions also extracted trade signals from finance
 influencers and resolved them against real prices; that part was retired in
-November 2026.)
+November 2026.) An optional, off-by-default Telegram alert reports one
+analyst's own stated long/short positions.
 
 > ⚠️ **Tracking and research only — no real money, no orders are ever placed,
 > not financial advice.** See the [Disclaimer](#disclaimer).
@@ -25,9 +26,9 @@ It became a sandbox for learning a lot of things end to end:
   deduplication and pre-LLM gating.
 - **Signal evaluation** - resolving claims against real price history instead of
   taking claimed track records at face value (the retired trade-call phase, and
-  later one-off studies such as the TechCharts chart study in `docs/`).
-- **Production-style ops** - Dockerized services, cron pipelines, health checks,
-  outage alerting, and a self-hosted dashboard.
+  later one-off studies in `docs/`).
+- **Production-style ops** - Dockerized services, cron pipelines, outage
+  detection, and a self-hosted dashboard.
 
 Nothing here places orders. The goal was to learn and to satisfy my own
 curiosity, not to give or follow investment advice.
@@ -54,6 +55,11 @@ curiosity, not to give or follow investment advice.
   freshness, stance) side by side, grouped by asset class, with a 60-day
   sentiment-balance chart and a map of the BTC price levels each analyst is
   watching. Every view is also appended to an append-only history log.
+- **Position alerts (optional, off by default)** - `trade_alerts.py` reads what
+  one analyst writes about his *own* long/short positions and, when enabled,
+  sends one Telegram message per post. It has no broker connection and places
+  no orders; credentials come from the environment, never from the repo. See
+  [docs/joao_trade_alerts.md](docs/joao_trade_alerts.md).
 
 **Dashboard and operations**
 
@@ -125,7 +131,7 @@ served by the dashboard.
 | Dashboard | **Dash / Plotly** (dark, GitHub-style theme) |
 | Market data | **yfinance** (prices), RSS (YouTube detection) |
 | Data sources | Third-party X/Twitter APIs; YouTube videos read natively by Gemini; MakeItCount chapter metadata and selected real frames fetched with yt-dlp / FFmpeg |
-| Packaging / ops | **Docker** + Docker Compose (dashboard runs non-root, read-only repo mount, all capabilities dropped, no Docker socket), cron pipelines, health checks |
+| Packaging / ops | **Docker** + Docker Compose (dashboard runs non-root, read-only repo mount, all capabilities dropped, no Docker socket), cron pipelines |
 | Storage | Plain JSON event logs + state files (no database) |
 | Diagnostics | Local logs, exit codes and dashboard freshness indicators |
 
@@ -134,14 +140,6 @@ served by the dashboard.
 ## Screenshots
 
 > _Screenshots coming soon._
-
-<!--
-Add images here, e.g.:
-
-![Overview — normalized performance vs S&P 500](docs/screenshots/overview.png)
-![Paper account — live positions](docs/screenshots/paper-account.png)
-![Research digests](docs/screenshots/research.png)
--->
 
 ---
 
@@ -159,6 +157,8 @@ ingestion_queue.py     # durable input queue (commit output before acknowledging
 storage.py             # strict ledger reads, advisory file locks, atomic JSON writes
 llm_support.py         # JSON-schema validation + usage counting for LLM calls
 cost_log.py            # per-run spend telemetry
+trade_alerts.py        # optional Telegram alerts on one analyst's own positions (off by default)
+telegram_notifications.py  # stdlib Telegram sender (credentials from environment only)
 assets/                # dashboard front-end script
 scripts/               # model-deprecation check, dashboard content check, backup
 tests/                 # unit tests (recovery, ingestion queue, digests, dashboard)
@@ -171,14 +171,10 @@ The [September 2026 audit](docs/audit_2026-09-08.md) documents reliability and
 security fixes, regression coverage, deployment changes, and remaining limits
 on signal completeness and performance statistics.
 
-The [signal-accuracy update](docs/signal_accuracy_2026-09-30.md) describes
-the event/price evidence rules, own-thread handling, historical review,
-15-minute market-hours monitoring and the dashboard's replay assumptions.
-
 Further write-ups: the [copy-trading review](docs/copy_trading_review_2026-10-02.md)
 (whether following the then-monitored calls would have paid; in Hungarian), the
-[TechCharts chart study](docs/techcharts_chart_study_2026-11-06.md) (grading an
-analyst's chart posts against real prices; in Hungarian) and the
+[signal-accuracy update](docs/signal_accuracy_2026-09-30.md) (evidence rules of
+the retired trade-call pipeline, kept as history) and the
 [model review](docs/model_review_2026-09-30.md) (why the current Gemini models
 were kept after side-by-side tests on real inputs).
 
@@ -187,7 +183,7 @@ were kept after side-by-side tests on real inputs).
 The short version, with the evidence in [`docs/`](docs/):
 
 - Claimed track records do not survive resolution against real prices (the
-  retired trade-call phase, and the later chart study). Some
+  retired trade-call phase, and later one-off studies). Some
   "calls" had a target or stop already past the entry when posted, and recaps of
   old trades look like fresh signals until the extraction is grounded in the
   post's own text and trade date.
@@ -246,10 +242,11 @@ MIT, see [LICENSE](LICENSE).
 This is a **personal, educational project**.
 
 - **No trading.** This project places no orders and connects to no brokerage.
-  It only reads public posts and tracks how the calls in them would have
-  resolved against historical prices.
+  It only reads public posts and videos and summarises what the analysts say.
+  The optional Telegram alert (off by default) only forwards one analyst's own
+  stated positions as text.
 - **Not financial advice.** Nothing in this repository is a recommendation to
-  buy or sell any security or asset. The signals are automated interpretations
+  buy or sell any security or asset. The summaries are automated interpretations
   of third-party social-media content and are frequently wrong.
 - **No affiliation.** This project is not affiliated with, endorsed by, or
   sponsored by any of the monitored accounts, Google, or any data provider. All
