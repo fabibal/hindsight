@@ -99,17 +99,19 @@ class _NoMediaRedirects(urllib.request.HTTPRedirectHandler):
         raise urllib.error.URLError("Media redirects are not allowed")
 
 
-def _image_block(url):
+def _image_block(url, size="small"):
     """Download a Twitter media photo and return a Gemini image Part, or None
     on any failure. `name=small` keeps the download (and the vision token cost)
-    modest while staying legible for chart levels."""
+    modest while staying legible for chart levels. Callers that must read exact
+    printed numbers (joao_levels) pass size="large": on small images a 2026-11-21
+    test misread 3 of ~30 chart numbers; large images misread none."""
     try:
         parts = urllib.parse.urlsplit(url)
         if (parts.scheme != "https" or parts.hostname != "pbs.twimg.com"
                 or parts.username or parts.password or parts.port not in (None, 443)):
             raise ValueError("Untrusted Twitter media URL")
         query = dict(urllib.parse.parse_qsl(parts.query))
-        query["name"] = "small"
+        query["name"] = size
         url = urllib.parse.urlunsplit(parts._replace(
             query=urllib.parse.urlencode(query), fragment=""))
         req = urllib.request.Request(url,

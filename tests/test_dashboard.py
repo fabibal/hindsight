@@ -1,4 +1,5 @@
 """Exercise dashboard callbacks offline, without starting the background warmer."""
+import json
 import pytest
 import dashboard as dash
 
@@ -17,7 +18,7 @@ def test_non_trading_tabs_do_not_warm_prices(monkeypatch, tab):
     def forbidden(*args, **kwargs):
         raise AssertionError('Irrelevant tab requested price data')
     monkeypatch.setattr(dash, 'warm_prices', forbidden)
-    assert len(dash.refresh_influencers(0, tab)) == 12
+    assert len(dash.refresh_influencers(0, tab)) == 13
 
 
 def test_intraday_close_expires_instead_of_being_cached_forever(monkeypatch):
@@ -45,10 +46,10 @@ def test_retired_feature_absent_and_remaining_tabs_switch():
             assert 'reddit' not in client.get(url).get_data(as_text=True).lower()
     tabs = ['BenCowen', 'JesseOlson',
             'KiYoungJu', 'JoaoWedson', 'DorkChicken', 'DaanCrypto', 'DonAlt',
-            'CowenX', 'Glassnode', 'Truecrypto', 'GeoffKendrick', 'MakeItCount']
+            'CowenX', 'Glassnode', 'Truecrypto', 'GeoffKendrick', 'MakeItCount', 'JoaoLevels']
     for tab in tabs:
         result = dash.switch_influencer_subtab(tab)
-        assert len(result) == 12
+        assert len(result) == 13
         assert sum(style['display'] == 'block' for style in result) == 1
     assert all(style['display'] == 'none'
                for style in dash.switch_influencer_subtab('Consensus'))
@@ -260,3 +261,21 @@ def _scored(net, bench=None, day='2026-09-01'):
     if bench is not None:
         r['benchmark_pct'] = bench
     return r
+
+
+def test_joao_levels_section_renders_own_positions_and_hides_noise():
+    def row(tid, day, kind, low, asset="BTC", direction="none", high=None):
+        return {"tweet_id": tid, "posted_at": f"2026-10-{day}T10:00:00+00:00", "url": f"https://x.com/a/status/{tid}",
+                "asset": asset, "kind": kind, "direction": direction, "low": low, "high": high,
+                "source": "text", "evidence": "e", "note": "n"}
+    rows = [row("1", "08", "own_entry", 96690.54, direction="short"),
+            row("2", "20", "own_entry", 96690.54, direction="short"),
+            row("2", "20", "price_ref", 84000), row("2", "20", "support", 77000, high=79000),
+            row("3", "21", "onchain_threshold", 0, asset="TOTAL"),
+            row("4", "22", "support", 2500, asset="ETH")]
+    text = json.dumps(dash.joao_levels_section(rows), default=lambda o: o.to_plotly_json(), ensure_ascii=False)
+    assert "96,690.54" in text and "2× említve, utoljára" in text and "napja" in text   # same entry collapsed
+    assert "84,000" not in text                                                # price_ref hidden
+    assert "2,500" not in text and "ETH" not in text.split("BTC szintek")[1]   # only BTC levels listed
+    assert "77,000–79,000" in text
+    assert dash.joao_levels_section([])[0].children.startswith("Még nincs")

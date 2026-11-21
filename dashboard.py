@@ -1487,6 +1487,158 @@ def kendrick_forecast_section(forecasts, limit=12):
     return [html.Div(children)]
 
 
+# --- Joao Wedson level ledger (joao_levels.py) -----------------------------
+# Every explicit level / threshold in his posts (text AND chart images), derived
+# flat file data/joao_levels.json. Not graded against price yet.
+JOAO_LEVELS_FILE = os.path.join(DATA_DIR, "joao_levels.json")
+
+_LV_KINDS = {  # kind -> (Hungarian label, colour)
+    "own_entry": ("Saját belépő", C["purple"]), "own_target": ("Saját cél", C["purple"]),
+    "own_stop": ("Saját stop", C["purple"]), "own_invalidation": ("Saját invalidáció", C["purple"]),
+    "support": ("Támasz", C["green"]), "resistance": ("Ellenállás", C["red"]),
+    "liquidation_cluster_long": ("Long likvid.", C["yellow"]),
+    "liquidation_cluster_short": ("Short likvid.", C["orange"]),
+    "onchain_cost_basis": ("On-chain költségszint", C["blue"]),
+    "onchain_threshold": ("On-chain küszöb", C["blue"]), "other": ("Egyéb", C["dim"]),
+}
+_LV_HIDDEN = {"price_ref", "positioning_avg_entry"}   # last-price prints / cohort averages: noise
+_LV_ORDER = list(_LV_KINDS)
+_LV_MAX_POSTS = 25
+
+
+def load_joao_levels():
+    return _load_summaries(JOAO_LEVELS_FILE)
+
+
+def _lv_num(v):
+    # 8 significant digits: entry prices must stay exact (96.41679, 0.1986488).
+    return f"{v:,.2f}".rstrip("0").rstrip(".") if abs(v) >= 1000 else f"{v:.8g}"
+
+
+def _lv_price(lv):
+    lo, hi = lv.get("low"), lv.get("high")
+    if not isinstance(lo, (int, float)):
+        return "—"
+    return _lv_num(lo) + (f"–{_lv_num(hi)}" if isinstance(hi, (int, float)) else "")
+
+
+def _lv_chip(lv):
+    label, color = _LV_KINDS.get(lv.get("kind"), _LV_KINDS["other"])
+    return html.Span([html.Span(label + " ", style={"color": color}), _lv_price(lv)],
+                     title=lv.get("note") or "", style={
+        "display": "inline-block", "background": C["bg"], "border": f"1px solid {C['border']}",
+        "borderRadius": "10px", "padding": "1px 8px", "margin": "2px 4px 2px 0",
+        "fontSize": "0.72rem", "color": C["text"], "fontFamily": MONO})
+
+
+def _lv_post_link(lv, text):
+    return html.A(text, href=_safe_href(lv.get("url")), target="_blank",
+                  rel="noopener noreferrer",
+                  style={"color": C["blue"], "textDecoration": "none"})
+
+
+def _lv_days_ago(iso):
+    try:
+        d = (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).days
+    except (TypeError, ValueError):
+        return "?"
+    return "ma" if d <= 0 else f"{d} napja"
+
+
+def _lv_own_positions(rows):
+    """His own entries/targets/stops, one row per distinct level (the same entry
+    is re-shown in many posts: first seen + mention count)."""
+    own = {}
+    for r in rows:
+        if not str(r.get("kind", "")).startswith("own_"):
+            continue
+        key = (r["asset"], r["kind"], r.get("direction"), r.get("low"), r.get("high"))
+        own.setdefault(key, []).append(r)
+    items = sorted(own.values(), key=lambda g: g[0].get("posted_at") or "", reverse=True)
+    out = []
+    for g in items:
+        first, last = g[0], g[-1]
+        label, color = _LV_KINDS.get(first["kind"], _LV_KINDS["other"])
+        side = {"short": C["red"], "long": C["green"]}.get(first.get("direction"), C["dim"])
+        out.append(html.Div(style={"display": "flex", "flexWrap": "wrap", "gap": "10px",
+                                   "alignItems": "baseline", "padding": "5px 0",
+                                   "borderTop": f"1px solid {C['border']}",
+                                   "fontSize": "0.8rem"},
+                            **{"data-ts": last.get("posted_at") or ""}, children=[
+            html.Span((first.get("posted_at") or "")[:10], style={"color": C["dim"], "fontFamily": MONO}),
+            html.Span(first["asset"], style={"fontWeight": "bold"}),
+            html.Span((first.get("direction") or "").upper(), style={"color": side, "fontSize": "0.7rem"}),
+            html.Span(label, style={"color": color}),
+            html.Span(_lv_price(first), style={"fontFamily": MONO}),
+            html.Span([_lv_post_link(first, "első poszt"),
+                       (f" · {len(g)}× említve, utoljára {_lv_days_ago(last.get('posted_at'))}"
+                        if len(g) > 1 else "")], style={"color": C["dim"], "fontSize": "0.72rem"}),
+        ]))
+    return out
+
+
+def joao_levels_section(rows):
+    if not rows:
+        return [html.Div("Még nincs rögzített szint.", style={
+            "color": C["dim"], "fontSize": "0.8rem", "marginTop": "8px"})]
+    visible = [r for r in rows if r.get("asset") == "BTC" and r.get("kind") not in _LV_HIDDEN]
+    posts = {r["tweet_id"] for r in rows}
+    dates = sorted((r.get("posted_at") or "")[:10] for r in rows if r.get("posted_at"))
+    head = html.Div(f"{len(rows)} szint · {len(posts)} poszt · {dates[0]} – {dates[-1]}", style={
+        "color": C["dim"], "fontSize": "0.72rem", "marginTop": "6px"})
+    children = [head]
+    own = _lv_own_positions(rows)
+    if own:
+        children.append(html.Div("Saját pozíciói", style={**_SECTION_H, "marginTop": "14px",
+                                                           "fontSize": "0.85rem"}))
+        children.append(html.Div(own, style={"marginTop": "4px"}))
+    by_asset = {}
+    for r in visible:
+        by_asset.setdefault(r["asset"], []).append(r)
+    order = sorted(by_asset, key=lambda a: len({x["tweet_id"] for x in by_asset[a]}), reverse=True)
+    children.append(html.Div("BTC szintek", style={**_SECTION_H, "marginTop": "16px",
+                                                           "fontSize": "0.85rem"}))
+    for i, asset in enumerate(order):
+        per_post = {}
+        for r in by_asset[asset]:
+            per_post.setdefault(r["tweet_id"], []).append(r)
+        posts_desc = sorted(per_post.values(), key=lambda g: g[0].get("posted_at") or "", reverse=True)
+        for g in posts_desc:
+            g.sort(key=lambda r: (_LV_ORDER.index(r["kind"]) if r["kind"] in _LV_ORDER else 99,
+                                  r.get("low") or 0))
+        # Liquidation clusters (Alphractal tool output, often 10+ per post) and
+        # unit-less metric thresholds ("0", "0.42") are not his price levels: posts
+        # go behind one closed toggle at the bottom (every post that has any).
+        is_aux = lambda r: str(r["kind"]).startswith("liquidation_") or r["kind"] == "onchain_threshold"
+        main_posts = [g for g in posts_desc if any(not is_aux(r) for r in g)]
+        aux_posts = [g for g in posts_desc if any(is_aux(r) for r in g)]
+
+        def post_line(g, only=None):
+            return html.Div(style={"padding": "6px 0", "borderTop": f"1px solid {C['border']}"},
+                            **{"data-ts": g[0].get("posted_at") or ""}, children=[
+                html.Span(_lv_post_link(g[0], _local_stamp(g[0].get("posted_at"))),
+                          style={"fontFamily": MONO, "fontSize": "0.72rem", "marginRight": "10px"}),
+                *[_lv_chip(r) for r in g if only is None or only(r)]])
+
+        lines = [post_line(g, lambda r: not is_aux(r)) for g in main_posts[:_LV_MAX_POSTS]]
+        if len(main_posts) > _LV_MAX_POSTS:
+            lines.append(html.Div(f"+{len(main_posts) - _LV_MAX_POSTS} régebbi poszt elrejtve",
+                                  style={"color": C["dim"], "fontSize": "0.7rem", "paddingTop": "6px"}))
+        if aux_posts:
+            lines.append(html.Details(style={"borderTop": f"1px solid {C['border']}", "paddingTop": "6px"},
+                                      children=[
+                html.Summary(f"Likvidációs / mérőszám-szintek ({len(aux_posts)} poszt)", style={
+                    "cursor": "pointer", "color": C["dim"], "fontSize": "0.72rem"}),
+                html.Div([post_line(g, is_aux) for g in aux_posts[:_LV_MAX_POSTS]])]))
+        children.append(html.Details(open=(i == 0), style={
+            "background": C["card"], "border": f"1px solid {C['border']}", "borderRadius": "8px",
+            "padding": "8px 14px", "marginTop": "8px"}, children=[
+            html.Summary(f"{asset}  ·  {len(by_asset[asset])} szint, {len(per_post)} poszt",
+                         style={"cursor": "pointer", "fontWeight": "bold", "fontSize": "0.85rem"}),
+            html.Div(lines, style={"marginTop": "6px", "overflowWrap": "anywhere"})]))
+    return [html.Div(children)]
+
+
 # --- Consensus: cross-feed CURRENT VIEW summary ----------------------------
 # One row per analysis-only digest feed that produces a rolling CURRENT VIEW
 # (twitter_digest.py / youtube_monitor.py), so "who is bearish right now" is one
@@ -2084,6 +2236,8 @@ app.layout = html.Div(
                                      style=_TAB_STYLE, selected_style=_TAB_SELECTED),
                              dcc.Tab(label="Geoff Kendrick", value="GeoffKendrick",
                                      style=_TAB_STYLE, selected_style=_TAB_SELECTED),
+                             dcc.Tab(label="Joao szintek", value="JoaoLevels",
+                                     style=_TAB_STYLE, selected_style=_TAB_SELECTED),
                          ])),
         ]),   # end sticky-head
 
@@ -2316,6 +2470,13 @@ app.layout = html.Div(
                          **{"data-view": "GeoffKendrick"}),
             ]),
 
+            # Joao szintek: his levels / own entries from posts + chart images.
+            html.Div(id="joaolevels-view", style={"display": "none"}, children=[
+                html.Div("Joao Wedson — rögzített szintek", style=_SECTION_H),
+                html.Div(id="joaolevels-summaries", style={"marginTop": "4px"},
+                         **{"data-view": "JoaoLevels"}),
+            ]),
+
 
     ],
 )
@@ -2358,7 +2519,7 @@ def refresh_data_version(_n, current):
 # Feed view panels, in the order of the Outputs of the two callbacks below.
 _PANELS = ["BenCowen", "JesseOlson", "KiYoungJu", "JoaoWedson", "DorkChicken",
            "DaanCrypto", "DonAlt", "CowenX", "Glassnode", "Truecrypto",
-           "GeoffKendrick", "MakeItCount"]
+           "GeoffKendrick", "MakeItCount", "JoaoLevels"]
 
 
 @app.callback(
@@ -2374,6 +2535,7 @@ _PANELS = ["BenCowen", "JesseOlson", "KiYoungJu", "JoaoWedson", "DorkChicken",
     Output("truecrypto-view", "style"),
     Output("kendrick-view", "style"),
     Output("makeitcount-view", "style"),
+    Output("joaolevels-view", "style"),
     Input("influencer-subtabs", "value"),
 )
 def switch_influencer_subtab(account):
@@ -2406,6 +2568,7 @@ _FEED_RENDERERS = {
         load_kendrick_forecasts())),
     "MakeItCount": (11, lambda: youtube_section(
         load_makeitcount_summaries(), limit=2, empty_label="MakeItCount")),
+    "JoaoLevels": (12, lambda: joao_levels_section(load_joao_levels())),
 }
 assert sorted(i for i, _ in _FEED_RENDERERS.values()) == list(range(len(_PANELS)))
 
@@ -2423,6 +2586,7 @@ assert sorted(i for i, _ in _FEED_RENDERERS.values()) == list(range(len(_PANELS)
     Output("truecrypto-summaries", "children"),
     Output("kendrick-summaries", "children"),
     Output("makeitcount-summaries", "children"),
+    Output("joaolevels-summaries", "children"),
     Input("data-version", "data"),
     Input("influencer-subtabs", "value"),
 )
@@ -2455,7 +2619,7 @@ def refresh_consensus(_version, account):
 
 
 # Every view the URL hash may name.
-_VIEWS = sorted({"Consensus", "GeoffKendrick",
+_VIEWS = sorted({"Consensus", "GeoffKendrick", "JoaoLevels",
                  *(target for *_, target in _CONSENSUS_SOURCES)})
 
 # View <-> URL hash, plus the Consensus SOURCE labels / back link. One callback

@@ -7,7 +7,7 @@ market prices through their normal dashboard callbacks).
 import json,urllib.request
 base='http://127.0.0.1:8051'
 deps=json.load(urllib.request.urlopen(base+'/_dash-dependencies',timeout=10))
-for tab in ['Consensus','BenCowen','JesseOlson','MakeItCount','KiYoungJu','JoaoWedson','DorkChicken','DaanCrypto','DonAlt','CowenX','Glassnode','Truecrypto','GeoffKendrick']:
+for tab in ['Consensus','BenCowen','JesseOlson','MakeItCount','KiYoungJu','JoaoWedson','DorkChicken','DaanCrypto','DonAlt','CowenX','Glassnode','Truecrypto','GeoffKendrick','JoaoLevels']:
  dep=next(d for d in deps if (d['output']=='consensus-panel.children' if tab=='Consensus' else d['output'].startswith('..') and 'youtube-summaries.children' in d['output']))
  key=dep['output']
  parts=key[2:-2].split('...') if key.startswith('..') else [key]

@@ -11,6 +11,7 @@ import pytest
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
+import joao_levels as jl
 import monitor
 import telegram_notifications as tg
 import trade_alerts as ta
@@ -462,6 +463,8 @@ class ProcessClient(FakeClient):
             if self.fail_events:
                 raise genai_errors.APIError(500, {"error": {"message": "x"}})
             payload = {"events": self.events}
+        elif schema is jl.SCHEMA:
+            payload = {"levels": []}
         else:
             payload = analysis_value()
         return SimpleNamespace(text=json.dumps(payload), usage_metadata=SimpleNamespace(
@@ -482,9 +485,10 @@ def test_joao_process_adds_trade_events_other_feeds_do_not(monkeypatch):
     client = ProcessClient(events=[ev(evidence="I'm SHORT in the short term")])
     records, *_ = tw.process([raw_tweet("1", text)], client, tw.FEEDS["joao_wedson"], allow_vision=False)
     assert records[0]["trade_events"][0]["asset"] == "BTC"
+    assert records[0]["levels"] == []                # level extraction ran for joao
     client2 = ProcessClient()
     records2, *_ = tw.process([raw_tweet("2", text)], client2, tw.FEEDS["ki_young_ju"], allow_vision=False)
-    assert "trade_events" not in records2[0] and client2.calls == 1
+    assert "trade_events" not in records2[0] and "levels" not in records2[0] and client2.calls == 1
 
 
 def test_failed_classification_leaves_the_post_unseen(monkeypatch):

@@ -97,6 +97,7 @@ from google.genai import errors as genai_errors
 
 import cost_log
 import trade_alerts
+import joao_levels
 from storage import write_json_atomic
 # Reuse monitor.py's tested helpers (env/json loaders, GetXAPI client + tweet
 # normalizer, the Gemini image-block fetch, local outage reporting) so this stays DRY
@@ -412,6 +413,9 @@ class Feed:
     # (trade_alerts.extract_events, a separate small Gemini call) and feed the
     # Telegram alert queue. See trade_alerts.py.
     trade_alerts: bool = False
+    # Joao-only: record every explicit price level / threshold from the post text
+    # AND images (joao_levels.extract_levels, own call, large images) -> `levels`.
+    level_extraction: bool = False
 
     @property
     def is_search(self):
@@ -470,6 +474,7 @@ FEEDS = {f.key: f for f in [
         max_fetch=60,                    # ~6 posts/day -> ~10 days of headroom
         current_view_file=os.path.join(DATA_DIR, "joao_wedson_current_view.json"),
         trade_alerts=True,
+        level_extraction=True,
     ),
     Feed(
         key="dorkchicken",
@@ -1056,6 +1061,18 @@ def process(candidates, gemini_client, feed, allow_vision=True):
             total_out += trade[3]
 
         media = n.get("media") or []           # photo URLs (charts) on this post
+        lv = None
+        if feed.level_extraction:
+            # Same retry-next-run contract as the trade events above.
+            lv = joao_levels.extract_levels(
+                gemini_client, text, date, media if allow_vision else [], model=MODEL,
+                thinking=GEMINI_THINKING, tally=LLM_TALLY, types=genai_types,
+                errors=genai_errors)
+            if lv is None:
+                print("    level extraction failed; skipping", file=sys.stderr)
+                continue
+            total_in += lv[2]
+            total_out += lv[3]
         rec = {
             "tweet_id": tid,
             "created_at": n.get("created_at"),
@@ -1074,6 +1091,10 @@ def process(candidates, gemini_client, feed, allow_vision=True):
             rec["trade_events"] = trade[0]
             if trade[1]:
                 rec["trade_events_rejected"] = trade[1]
+        if lv is not None:
+            rec["levels"] = lv[0]
+            if lv[1]:
+                rec["levels_rejected"] = lv[1]
         if feed.is_search:                     # who posted it + dedup fingerprint
             rec["author"] = author             # (the ledger's cross-run seen_sigs)
             rec["text_sig"] = _content_sig(text)
@@ -1716,6 +1737,8 @@ def run_feed(feed, gemini_client, args):
     write_json_atomic(feed.summaries_file, merged)
     pending.acknowledge(by_id)
     print(f"Wrote {len(merged)} summaries -> {feed.summaries_file}")
+    if feed.level_extraction:
+        joao_levels.rebuild(merged)
 
     alert_error = _try_dispatch(feed, merged, args)
     refresh_current_view(gemini_client, feed, merged, _select_current_view_window, generate_current_view,
