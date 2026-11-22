@@ -1025,6 +1025,9 @@ def analyze_chart(gemini_client, feed, media_urls, date, text, author):
     return parsed, in_tok, out_tok
 
 
+LEVEL_RECHECKS = 2        # re-reads of a post's levels when an image alert event disagrees
+
+
 # --- main -----------------------------------------------------------------
 def process(candidates, gemini_client, feed, allow_vision=True):
     """Analyze each candidate tweet; return (records, in_tok, out_tok)."""
@@ -1047,23 +1050,11 @@ def process(candidates, gemini_client, feed, allow_vision=True):
             print("    text analysis failed; skipping", file=sys.stderr)
             continue
 
-        trade = None
-        if feed.trade_alerts:
-            # A failed classification skips the post (it stays unseen and is
-            # retried next run) -- an alert must never be lost to a one-off API error.
-            trade = trade_alerts.extract_events(
-                gemini_client, text, date, model=MODEL, thinking=GEMINI_THINKING,
-                tally=LLM_TALLY, types=genai_types, errors=genai_errors)
-            if trade is None:
-                print("    trade-event classification failed; skipping", file=sys.stderr)
-                continue
-            total_in += trade[2]
-            total_out += trade[3]
-
         media = n.get("media") or []           # photo URLs (charts) on this post
+        # Levels first: they also cross-check the image-sourced position events below.
         lv = None
         if feed.level_extraction:
-            # Same retry-next-run contract as the trade events above.
+            # Same retry-next-run contract as the trade events below.
             lv = joao_levels.extract_levels(
                 gemini_client, text, date, media if allow_vision else [], model=MODEL,
                 thinking=GEMINI_THINKING, tally=LLM_TALLY, types=genai_types,
@@ -1073,6 +1064,46 @@ def process(candidates, gemini_client, feed, allow_vision=True):
                 continue
             total_in += lv[2]
             total_out += lv[3]
+
+        trade = None
+        if feed.trade_alerts:
+            # A failed classification skips the post (it stays unseen and is
+            # retried next run) -- an alert must never be lost to a one-off API error.
+            trade = trade_alerts.extract_events(
+                gemini_client, text, date, model=MODEL, thinking=GEMINI_THINKING,
+                tally=LLM_TALLY, types=genai_types, errors=genai_errors,
+                media_urls=media if allow_vision else [])
+            if trade is None:
+                print("    trade-event classification failed; skipping", file=sys.stderr)
+                continue
+            total_in += trade[2]
+            total_out += trade[3]
+            # Image (position-card) events need the independent level read to agree.
+            accepted, rejected = trade_alerts.reconcile_image_events(
+                trade[0], lv[0] if lv else [])
+            # The level read misreads a printed number now and then (EU-format
+            # "1.658,85" -> 1.65885, ~1 in 3 on one card): re-read it, up to twice,
+            # while a card event is rejected for disagreeing. Only agreement counts.
+            for _ in range(LEVEL_RECHECKS):
+                if not (lv and any(e.get("rejected_reason") == "no_matching_level_read"
+                                   for e in rejected)):
+                    break
+                again = joao_levels.extract_levels(
+                    gemini_client, text, date, media if allow_vision else [], model=MODEL,
+                    thinking=GEMINI_THINKING, tally=LLM_TALLY, types=genai_types,
+                    errors=genai_errors)
+                if again is None:
+                    break
+                total_in += again[2]
+                total_out += again[3]
+                lv = again
+                accepted, rejected = trade_alerts.reconcile_image_events(
+                    trade[0], lv[0])
+            trade = (accepted, trade[1] + rejected, trade[2], trade[3])
+            if rejected:
+                print(f"    [trade events] {len(rejected)} event(s) rejected "
+                      "(unverified / duplicate)", file=sys.stderr)
+
         rec = {
             "tweet_id": tid,
             "created_at": n.get("created_at"),

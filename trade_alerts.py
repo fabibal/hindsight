@@ -45,6 +45,7 @@ STATE_VERSION = 1
 SHADOW_CAP = 300
 MAX_SEND_ATTEMPTS = 10          # one attempt per daily run -> ~10 days before "failed"
 EXTRACT_ATTEMPTS = 2
+IMAGE_CAP = 4
 
 # --- extraction ------------------------------------------------------------
 EVENT_SYSTEM = (
@@ -60,8 +61,21 @@ EVENT_SYSTEM = (
     "stated position ('my shorts rarely fail', 'those who followed my shorts did "
     "well'); questions to the audience; opinions about where price may go; other "
     "people's calls. The words long/short inside a market analysis are NOT his "
-    "position. Never infer a position from a chart, a link or another post: use "
-    "only this text. A negation ('I am not short') gives no event.\n"
+    "position. Never infer a position from a link or another post. A negation "
+    "('I am not short') gives no event.\n"
+    "IMAGES: the post may carry images. A Binance Futures / Hyperliquid POSITION "
+    "CARD (shows the asset e.g. 'TAKEUSDT Perpetual', Short or Long, 'Entry Price', "
+    "PnL %) attached to HIS post is HIS position: return one event per card with "
+    "source 'image', stance 'own_current', action 'existing' (use 'open' / 'add' / "
+    "'reduce' / 'close' only if the post TEXT says he just did that), asset from the "
+    "card title ('TAKEUSDT' -> TAKE, 'BTCUSDC' -> BTC), direction from the card, "
+    "stated_prices = ['entry <exact entry price printed on the card>'], evidence = "
+    "'image N: <card title and side as printed>' (N = 1-based image number). Images "
+    "may use European number format: '1.658,85' = 1658.85, '86.519,9' = 86519.9, "
+    "'0,1986488' = 0.1986488. Do NOT create an event from: cards or screenshots of "
+    "other traders, whales or exchanges; liquidation heatmaps; ordinary charts, "
+    "arrows or buy/sell markers without a position card; mark prices. Events whose "
+    "source is 'text' use only the text and a verbatim quote as evidence.\n"
     "Fields per event:\n"
     "- asset: ticker in capitals (BTC, ETH, SOL ...) as named in the post "
     "('Bitcoin' -> BTC). Empty string if the post does not name the asset. Never "
@@ -79,8 +93,11 @@ EVENT_SYSTEM = (
     "still held).\n"
     "- timeframe: the horizon exactly as stated ('short term', 'next 2 months'), "
     "else empty string.\n"
-    "- evidence: the exact words from the post that support the event, copied "
-    "verbatim (at most 200 characters; use '...' between two copied fragments).\n"
+    "- source: 'text' (stated in the post text) or 'image' (read from a position "
+    "card image, see IMAGES).\n"
+    "- evidence: for source 'text' the exact words from the post, copied verbatim "
+    "(at most 200 characters; use '...' between two copied fragments); for source "
+    "'image' 'image N: <card title and side>'.\n"
     "- reason: one short sentence IN HUNGARIAN with the reason he gives, empty "
     "string if none.\n"
     "- stated_prices: any entry, stop or target price he states for this event, as "
@@ -106,12 +123,13 @@ EVENT_SCHEMA = {
                     "stance": {"type": "string",
                                "enum": ["own_current", "own_plan", "own_past_result"]},
                     "timeframe": {"type": "string"},
+                    "source": {"type": "string", "enum": ["text", "image"]},
                     "evidence": {"type": "string"},
                     "reason": {"type": "string"},
                     "stated_prices": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["asset", "direction", "action", "stance", "timeframe",
-                             "evidence", "reason", "stated_prices"],
+                             "source", "evidence", "reason", "stated_prices"],
                 "additionalProperties": False,
             },
         },
@@ -146,7 +164,7 @@ def evidence_in_text(evidence, text):
     return bool(parts) and all(p in hay for p in parts)
 
 
-def extract_events(client, text, date, *, model, thinking, tally, types, errors):
+def extract_events(client, text, date, *, model, thinking, tally, types, errors, media_urls=()):
     """Dedicated Joao call. Returns (events, rejected, in_tok, out_tok) or None.
 
     None means "could not be classified" (API error / unparsable / garbled text):
@@ -157,11 +175,17 @@ def extract_events(client, text, date, *, model, thinking, tally, types, errors)
     import monitor
     from llm_support import parse_response, token_usage
     in_tok = out_tok = 0
-    user = f"Posted by @joao_wedson (Joao Wedson)\nDate: {date}\nPost:\n{text}"
+    # Large images: position-card prices must be read exactly (small ones misread
+    # digits in a 2026-11-21 test).
+    imgs = [b for b in (monitor._image_block(u, size="large")
+                        for u in list(media_urls or ())[:IMAGE_CAP]) if b is not None]
+    user = (f"Posted by @joao_wedson (Joao Wedson)\nDate: {date}\nPost:\n{text}"
+            + (f"\n\n(Images attached: {len(imgs)}, numbered 1..)" if imgs else ""))
+    contents = [types.Part.from_text(text=user), *imgs] if imgs else user
     for attempt in range(1, EXTRACT_ATTEMPTS + 1):
         try:
             resp = client.models.generate_content(
-                model=model, contents=user,
+                model=model, contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=EVENT_SYSTEM,
                     response_mime_type="application/json",
@@ -181,7 +205,12 @@ def extract_events(client, text, date, *, model, thinking, tally, types, errors)
         good, bad = [], []
         for ev in parsed["events"]:
             ev = dict(ev, asset=normalize_asset(ev["asset"]))
-            (good if evidence_in_text(ev["evidence"], text) else bad).append(ev)
+            if ev["source"] == "image":      # cross-checked against the level read later
+                ok = bool(imgs) and ev["evidence"].strip().lower().startswith("image") \
+                    and bool(ev["stated_prices"]) and bool(ev["asset"])
+            else:
+                ok = evidence_in_text(ev["evidence"], text)
+            (good if ok else bad).append(ev)
         garbled = monitor._looks_mangled([e["reason"] for e in good])
         if (bad or garbled) and attempt < EXTRACT_ATTEMPTS:
             print("  [retry] trade events: unverified evidence or garbled text", file=sys.stderr)
@@ -196,6 +225,48 @@ def extract_events(client, text, date, *, model, thinking, tally, types, errors)
                   "verbatim quote", file=sys.stderr)
         return good, bad, in_tok, out_tok
     return None
+
+
+def _price_numbers(strings):
+    out = []
+    for text in strings:
+        for m in re.finditer(r"\d[\d,]*(?:\.\d+)?", str(text)):
+            try:
+                out.append(float(m.group(0).replace(",", "")))
+            except ValueError:
+                pass
+    return out
+
+
+def reconcile_image_events(events, levels):
+    """Image-sourced events are accepted only when the independent level
+    extraction (joao_levels, own call + schema) read the same card: an own_entry
+    on the same asset and side whose price matches the entry the event states
+    (within 0.5%). The event's price is then replaced by the level's exact value.
+    An image event on a (asset, side) that a text event already covers is dropped
+    as a duplicate. Returns (accepted, rejected)."""
+    text_keys = {_key(e) for e in events if e.get("source", "text") == "text"}
+    accepted, rejected = [], []
+    for ev in events:
+        if ev.get("source", "text") == "text":
+            accepted.append(ev)
+            continue
+        if _key(ev) in text_keys:
+            rejected.append(dict(ev, rejected_reason="duplicate_of_text_event"))
+            continue
+        stated = _price_numbers(ev["stated_prices"])
+        cands = [lv for lv in levels
+                 if lv.get("kind") == "own_entry" and lv.get("direction") == ev["direction"]
+                 and normalize_asset(lv.get("asset")) == ev["asset"]
+                 and any(abs(lv["low"] - n) <= 0.005 * abs(lv["low"]) for n in stated)]
+        # closest to the stated price; a card reading beats a text one on a tie
+        match = min(cands, key=lambda lv: (min(abs(lv["low"] - n) / abs(lv["low"]) for n in stated),
+                                           lv.get("source") != "chart"), default=None)
+        if match is None:
+            rejected.append(dict(ev, rejected_reason="no_matching_level_read"))
+            continue
+        accepted.append(dict(ev, stated_prices=[f"{ev['asset']} belépő {match['low']:.10g}"]))
+    return accepted, rejected
 
 
 # --- decision --------------------------------------------------------------
@@ -275,7 +346,10 @@ def render_message(post_url, post_time, events):
         prices = list(dict.fromkeys(p for e in evs for p in e["stated_prices"]))
         lines.append("Megadott ár/stop/cél: " + ("; ".join(prices) if prices else "nincs megadva"))
         quote = evs[0]["evidence"].strip().replace("\n", " ")
-        lines.append(f'Idézet: "{quote[:200]}"')
+        if evs[0].get("source") == "image":
+            lines.append("Forrás: a poszt képe (pozíciókártya), nem a szöveg")
+        else:
+            lines.append(f'Idézet: "{quote[:200]}"')
         blocks.append("\n".join(lines))
     head = ("Joao Wedson - " + blocks[0].split("\n", 1)[0] if len(blocks) == 1
             else "Joao Wedson - több pozícióközlés egy posztban")

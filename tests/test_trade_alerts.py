@@ -31,9 +31,9 @@ def isolated(tmp_path, monkeypatch):
 
 
 def ev(asset="BTC", direction="short", action="open", stance="own_current",
-       evidence="I decided to enter SHORT", timeframe="", reason="", prices=()):
+       evidence="I decided to enter SHORT", timeframe="", reason="", prices=(), source="text"):
     return {"asset": asset, "direction": direction, "action": action, "stance": stance,
-            "timeframe": timeframe, "evidence": evidence, "reason": reason,
+            "timeframe": timeframe, "source": source, "evidence": evidence, "reason": reason,
             "stated_prices": list(prices)}
 
 
@@ -530,3 +530,86 @@ def test_alert_failure_does_not_skip_the_current_view_refresh(tmp_path, monkeypa
     with pytest.raises(ta.AlertStateError):
         tw.run_feed(feed, object(), args)
     assert refresh.call_count == 1
+
+
+# --- image (position card) events ------------------------------------------------
+def card(asset, price, direction="short"):
+    return ev(asset=asset, direction=direction, action="existing", evidence=f"image 1: {asset}USDT Perpetual {direction}",
+              prices=[f"entry {price}"], source="image")
+
+
+def lvl_row(asset, low, source="chart", direction="short"):
+    return {"asset": asset, "kind": "own_entry", "direction": direction, "low": low, "source": source}
+
+
+def test_image_event_needs_matching_level_and_uses_exact_price():
+    acc, rej = ta.reconcile_image_events([card("HYPE", "96.41679")], [lvl_row("HYPE", 96.41679)])
+    assert acc[0]["stated_prices"] == ["HYPE belépő 96.41679"] and rej == []
+    acc, rej = ta.reconcile_image_events([card("HYPE", "96.41679")], [lvl_row("HYPE", 80.0)])      # price disagrees
+    assert acc == [] and rej[0]["rejected_reason"] == "no_matching_level_read"
+    acc, rej = ta.reconcile_image_events([card("HYPE", "96.41679")], [lvl_row("SOL", 96.41679)])   # other asset
+    assert acc == []
+    acc, rej = ta.reconcile_image_events([card("HYPE", "96.41679")], [lvl_row("HYPE", 96.41679, direction="long")])
+    assert acc == []                                                                              # other side
+
+
+def test_image_event_prefers_closest_level_and_dedups_against_text_event():
+    acc, _ = ta.reconcile_image_events([card("BTC", "96,690.54")],
+                                       [lvl_row("BTC", 97000, source="text"), lvl_row("BTC", 96690.54)])
+    assert acc[0]["stated_prices"] == ["BTC belépő 96690.54"]
+    acc, rej = ta.reconcile_image_events([ev(asset="BTC", evidence="x"), card("BTC", "96690.54")],
+                                         [lvl_row("BTC", 96690.54)])
+    assert [e["source"] for e in acc] == ["text"] and rej[0]["rejected_reason"] == "duplicate_of_text_event"
+
+
+def test_text_events_pass_through_and_card_message_says_image():
+    acc, _ = ta.reconcile_image_events([ev()], [])
+    assert len(acc) == 1
+    card_ev, _ = ta.reconcile_image_events([card("TAKE", "0.1986488")], [lvl_row("TAKE", 0.1986488)])
+    text = ta.render_message("https://x.com/j/status/1", "2026-10-08T10:00:00+00:00", card_ev)
+    assert "TAKE belépő 0.1986488" in text and "poszt képe" in text and "Idézet" not in text
+
+
+def test_extract_events_drops_unverifiable_image_events(monkeypatch):
+    monkeypatch.setattr(monitor, "_image_block", lambda url, size="small": genai_types.Part.from_bytes(data=b"x", mime_type="image/jpeg"))
+    bad_no_price = dict(card("TAKE", "0.1"), stated_prices=[])
+    good_card = card("TAKE", "0.1986488")
+    client = Mock()
+    client.models.generate_content.return_value = SimpleNamespace(
+        text=json.dumps({"events": [good_card, bad_no_price]}),
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1,
+                                       thoughts_token_count=0, tool_use_prompt_token_count=0))
+    good, bad, *_ = ta.extract_events(client, "All positions are in profit.", "2026-10-08", model="m", thinking=None,
+                                      tally=monitor.GeminiTally(), types=genai_types, errors=genai_errors,
+                                      media_urls=["https://pbs.twimg.com/media/a.jpg"])
+    assert [e["asset"] for e in good] == ["TAKE"] and len(bad) == 1
+    # without images an image-sourced event can never be accepted
+    good2, bad2, *_ = ta.extract_events(client, "All positions are in profit.", "2026-10-08", model="m", thinking=None,
+                                        tally=monitor.GeminiTally(), types=genai_types, errors=genai_errors)
+    assert good2 == [] and len(bad2) == 2
+
+
+def test_process_rereads_levels_until_card_event_agrees(monkeypatch):
+    import joao_levels as jl
+    monkeypatch.setattr(tw, "_normalize_getxapi", lambda t: {
+        "id": str(t["id"]), "text": t["text"], "created_at": "2026-10-08T15:52:00+00:00",
+        "media": ["https://pbs.twimg.com/media/a.jpg"], "author": "joao_wedson"})
+    calls = []
+    wrong, right = lvl_row("ZEC", 1.65885), lvl_row("ZEC", 1658.85)
+
+    def fake_levels(*a, **k):
+        calls.append(1)
+        return ([wrong] if len(calls) == 1 else [right]), [], 5, 5
+    monkeypatch.setattr(jl, "extract_levels", fake_levels)
+    monkeypatch.setattr(ta, "extract_events", lambda *a, **k: ([card("ZEC", "1658.85")], [], 5, 5))
+    records, *_ = tw.process([raw_tweet("9", "All positions are in profit.")], ProcessClient(),
+                             tw.FEEDS["joao_wedson"], allow_vision=True)
+    assert len(calls) == 2
+    assert records[0]["trade_events"][0]["stated_prices"] == ["ZEC belépő 1658.85"]
+    assert records[0]["levels"] == [right] and "trade_events_rejected" not in records[0]
+    calls.clear()
+    monkeypatch.setattr(jl, "extract_levels", lambda *a, **k: (calls.append(1) or [wrong], [], 5, 5))
+    records, *_ = tw.process([raw_tweet("10", "All positions are in profit.")], ProcessClient(),
+                             tw.FEEDS["joao_wedson"], allow_vision=True)
+    assert len(calls) == 1 + tw.LEVEL_RECHECKS and records[0]["trade_events"] == []   # never agreed: no alert
+    assert records[0]["trade_events_rejected"][0]["rejected_reason"] == "no_matching_level_read"

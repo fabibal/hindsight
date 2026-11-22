@@ -29,6 +29,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from flask import abort, send_from_directory
 
+import joao_grading
 import yfinance as yf
 from dash import (Dash, dcc, html, Input, Output, State, ALL,
                   no_update)
@@ -1504,6 +1505,10 @@ _LV_KINDS = {  # kind -> (Hungarian label, colour)
 _LV_HIDDEN = {"price_ref", "positioning_avg_entry"}   # last-price prints / cohort averages: noise
 _LV_ORDER = list(_LV_KINDS)
 _LV_MAX_POSTS = 25
+JOAO_LEVELS_START = "2025-12-01"        # first Joao post is 2025-12-26; one warmed OHLC history
+_LV_RGB = {"support": "63,185,80", "resistance": "248,81,73", "onchain_cost_basis": "88,166,255",
+           "own": "188,140,255"}
+_LV_STATE = {"held": ("✓ tartotta", C["green"]), "open": ("○ nyitott", C["dim"]), "broken": ("✗ áttörte", C["red"])}
 
 
 def load_joao_levels():
@@ -1522,13 +1527,118 @@ def _lv_price(lv):
     return _lv_num(lo) + (f"–{_lv_num(hi)}" if isinstance(hi, (int, float)) else "")
 
 
-def _lv_chip(lv):
+def _lv_chip(lv, grade=None):
     label, color = _LV_KINDS.get(lv.get("kind"), _LV_KINDS["other"])
-    return html.Span([html.Span(label + " ", style={"color": color}), _lv_price(lv)],
+    status = []
+    if grade and grade["state"] in _LV_STATE:
+        text, scolor = _LV_STATE[grade["state"]]
+        if grade["state"] == "broken":
+            text += " " + grade["end"][5:]
+        status = [html.Span(" " + text, style={"color": scolor, "fontSize": "0.66rem"})]
+    return html.Span([html.Span(label + " ", style={"color": color}), _lv_price(lv), *status],
                      title=lv.get("note") or "", style={
         "display": "inline-block", "background": C["bg"], "border": f"1px solid {C['border']}",
         "borderRadius": "10px", "padding": "1px 8px", "margin": "2px 4px 2px 0",
         "fontSize": "0.72rem", "color": C["text"], "fontFamily": MONO})
+
+
+def _lv_key(lv):
+    return (lv.get("tweet_id"), lv.get("kind"), lv.get("low"), lv.get("high"))
+
+
+def _lv_candles():
+    df = get_ohlc("BTC-USD", JOAO_LEVELS_START)
+    if df is None or df.empty:
+        return []
+    return [(d, float(r.High), float(r.Low), float(r.Close)) for d, r in zip(df.index, df.itertuples())]
+
+
+def _lv_chart(btc_rows, grades, candles):
+    """BTC price line + one segment per graded level (post day -> break day / today)
+    + his own BTC entries. na-graded levels are not drawn."""
+    import plotly.graph_objects as go
+    if not candles:
+        return None
+    drawn = [(r, grades[_lv_key(r)]) for r in btc_rows
+             if grades.get(_lv_key(r)) and grades[_lv_key(r)]["state"] in _LV_STATE]
+    owns = [r for r in btc_rows if r.get("kind") in ("own_entry", "own_target", "own_stop", "own_invalidation")]
+    # A level more than 20% away from every price the market printed since it was
+    # posted (a stray 41,500 from December, a mis-read metric "50.08") would only
+    # stretch the time axis back to where there is nothing to see: not drawn.
+    def near(r, g):
+        path = [c for c in candles if c[0] >= g["start"]]
+        lo = r["low"]
+        return bool(path) and min(c[2] for c in path) * 0.8 <= lo <= max(c[1] for c in path) * 1.2
+    drawn = [(r, g) for r, g in drawn if near(r, g)]
+    if not drawn and not owns:
+        return None
+    t0 = (date.fromisoformat(min([g["start"] for _, g in drawn]
+                                 + [(o.get("posted_at") or "")[:10] for o in owns])) - timedelta(days=7)).isoformat()
+    window = [c for c in candles if c[0] >= t0]
+    if not window:
+        return None
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[c[0] for c in window], y=[c[3] for c in window], mode="lines", name="BTC",
+                             line={"color": "#c9d1d9", "width": 1.4}, hovertemplate="%{x}: %{y:,.0f}<extra>BTC</extra>"))
+    seen = set()
+    for seg in _lv_merge_segments(drawn):
+        r, g = seg["r"], seg["g"]
+        kind = r["kind"]
+        if g["side"] == "support" and kind == "onchain_cost_basis":
+            key = "onchain_cost_basis"
+        else:
+            key = kind
+        rgb = _LV_RGB.get(key, _LV_RGB["support"])
+        label = _LV_KINDS[kind][0]
+        lo = r["low"]
+        hi = r["high"] if isinstance(r.get("high"), (int, float)) else lo
+        lo, hi = min(lo, hi), max(lo, hi)
+        mid = window[len(window) // 2][0]
+        s, e = g["start"], g["end"]
+        alpha, dash = {"held": (0.95, "solid"), "open": (0.75, "solid"), "broken": (0.28, "dot")}[g["state"]]
+        txt = (f"{label} {_lv_price(r)}<br>{s} → {e} · {_LV_STATE[g['state']][0]}"
+               + (f"<br>{seg['n']}× említve, utoljára {seg['last']}" if seg["n"] > 1 else "")
+               + f"<br>{(r.get('note') or '')[:90]}")
+        first = label not in seen
+        seen.add(label)
+        common = dict(legendgroup=label, name=label, showlegend=first, hovertemplate=txt + "<extra></extra>")
+        if hi > lo:
+            fig.add_trace(go.Scatter(x=[s, e, e, s, s], y=[lo, lo, hi, hi, lo], mode="lines", fill="toself",
+                                     fillcolor=f"rgba({rgb},{alpha * 0.3})", hoveron="fills+points",
+                                     line={"color": f"rgba({rgb},{alpha})", "width": 1, "dash": dash}, **common))
+        else:
+            md = (date.fromisoformat(s) + (date.fromisoformat(e) - date.fromisoformat(s)) / 2).isoformat()
+            fig.add_trace(go.Scatter(x=[s, md, e], y=[lo, lo, lo], mode="lines+markers",
+                                     marker={"size": [0, 0, 6 if g["state"] == "broken" else 0], "symbol": "x",
+                                             "color": f"rgb({rgb})"},
+                                     line={"color": f"rgba({rgb},{alpha})", "width": 1.4 if g["state"] == "broken" else 2.4 + 0.6 * min(seg["n"] - 1, 3), "dash": dash}, **common))
+    last = window[-1][0]
+    seen_own = set()
+    for o in sorted(owns, key=lambda x: x.get("posted_at") or ""):
+        if any(k[0] == o["kind"] and _lv_near(k[1], o["low"]) for k in seen_own):
+            continue
+        seen_own.add((o["kind"], o["low"]))
+        s = (o.get("posted_at") or "")[:10]
+        lab = _LV_KINDS[o["kind"]][0]
+        txt = f"{lab} {_lv_price(o)} {(o.get('direction') or '').upper()}<br>{s}<br>{(o.get('note') or '')[:90]}"
+        fig.add_trace(go.Scatter(x=[s, last], y=[o["low"], o["low"]], mode="lines+markers", name="Saját pozíció",
+                                 legendgroup="own", showlegend="own" not in seen,
+                                 marker={"size": [10, 0], "symbol": "diamond", "color": "rgb(188,140,255)"},
+                                 line={"color": "rgba(188,140,255,0.85)", "width": 1.6, "dash": "dash"},
+                                 hovertemplate=txt + "<extra></extra>"))
+        seen.add("own")
+    lows, highs = [c[2] for c in window], [c[1] for c in window]
+    fig.update_layout(
+        height=540, margin={"l": 10, "r": 10, "t": 30, "b": 10}, paper_bgcolor=C["card"], plot_bgcolor=C["card"],
+        font={"color": C["text"], "family": MONO, "size": 11}, hovermode="closest",
+        legend={"orientation": "h", "y": 1.08, "x": 0, "font": {"size": 11}},
+        yaxis={"range": [min(lows) * 0.93,
+                         max([max(highs) * 1.05] + [o["low"] * 1.03 for o in owns
+                                                    if max(highs) * 0.8 <= o["low"] <= max(highs) * 1.25])], "gridcolor": C["border"], "tickformat": ",.0f",
+               "fixedrange": False},
+        xaxis={"gridcolor": C["border"], "range": [t0, last]})
+    return dcc.Graph(figure=fig, config={"displayModeBar": False, "scrollZoom": False},
+                     style={"marginTop": "10px", "border": f"1px solid {C['border']}", "borderRadius": "8px"})
 
 
 def _lv_post_link(lv, text):
@@ -1545,21 +1655,67 @@ def _lv_days_ago(iso):
     return "ma" if d <= 0 else f"{d} napja"
 
 
+def _lv_near(a, b):
+    """The same level re-quoted (97,000 vs the card's 96,690.54): within 0.5%."""
+    return abs(a - b) <= 0.005 * max(abs(a), abs(b))
+
+
+def _lv_hi(r):
+    return r["high"] if isinstance(r.get("high"), (int, float)) else r["low"]
+
+
+def _lv_merge_segments(drawn):
+    """One chart segment per level: a re-mention while the earlier segment is still
+    alive (not yet broken) extends nothing -- it only raises the mention count.
+    drawn: [(row, grade)] -> [{"r", "g", "n", "last"}] oldest first."""
+    segs = []
+    for r, g in sorted(drawn, key=lambda x: x[1]["start"]):
+        for seg in segs:
+            if (seg["r"]["kind"] == r["kind"] and seg["g"]["side"] == g["side"]
+                    and _lv_near(seg["r"]["low"], r["low"]) and _lv_near(_lv_hi(seg["r"]), _lv_hi(r))
+                    and g["start"] <= seg["g"]["end"]):
+                seg["n"] += 1
+                seg["last"] = max(seg["last"], g["start"])
+                break
+        else:
+            segs.append({"r": r, "g": g, "n": 1, "last": g["start"]})
+    return segs
+
+
+def _lv_pnl(asset, direction, entry):
+    """(current price, unrealised % on the position, unlevered) or None. A price
+    outside 0.1x-10x of the entry is a wrong/stale Yahoo symbol, not a result."""
+    if direction not in ("short", "long") or not entry:
+        return None
+    price = get_price(_yf_symbol(asset, "crypto"))
+    if not price or not 0.1 <= price / entry <= 10:
+        return None
+    pct = (entry - price) / entry * 100 if direction == "short" else (price - entry) / entry * 100
+    return price, pct
+
+
 def _lv_own_positions(rows):
     """His own entries/targets/stops, one row per distinct level (the same entry
     is re-shown in many posts: first seen + mention count)."""
-    own = {}
-    for r in rows:
-        if not str(r.get("kind", "")).startswith("own_"):
-            continue
-        key = (r["asset"], r["kind"], r.get("direction"), r.get("low"), r.get("high"))
-        own.setdefault(key, []).append(r)
-    items = sorted(own.values(), key=lambda g: g[0].get("posted_at") or "", reverse=True)
+    groups = []        # [rows] per distinct position level (re-quotes of one level merged)
+    for r in sorted((x for x in rows if str(x.get("kind", "")).startswith("own_")),
+                    key=lambda x: x.get("posted_at") or ""):
+        for g in groups:
+            f = g[0]
+            if (f["asset"], f["kind"], f.get("direction")) == (r["asset"], r["kind"], r.get("direction")) \
+                    and _lv_near(f["low"], r["low"]):
+                g.append(r)
+                break
+        else:
+            groups.append([r])
+    items = sorted(groups, key=lambda g: g[0].get("posted_at") or "", reverse=True)
     out = []
     for g in items:
         first, last = g[0], g[-1]
+        exact = next((x for x in g if x.get("source") == "chart"), first)   # the card's digits
         label, color = _LV_KINDS.get(first["kind"], _LV_KINDS["other"])
         side = {"short": C["red"], "long": C["green"]}.get(first.get("direction"), C["dim"])
+        pnl = _lv_pnl(first["asset"], first.get("direction"), exact["low"]) if first["kind"] == "own_entry" else None
         out.append(html.Div(style={"display": "flex", "flexWrap": "wrap", "gap": "10px",
                                    "alignItems": "baseline", "padding": "5px 0",
                                    "borderTop": f"1px solid {C['border']}",
@@ -1569,7 +1725,11 @@ def _lv_own_positions(rows):
             html.Span(first["asset"], style={"fontWeight": "bold"}),
             html.Span((first.get("direction") or "").upper(), style={"color": side, "fontSize": "0.7rem"}),
             html.Span(label, style={"color": color}),
-            html.Span(_lv_price(first), style={"fontFamily": MONO}),
+            html.Span(_lv_price(exact), style={"fontFamily": MONO}),
+            *([html.Span([f"→ {_lv_num(float(f'{pnl[0]:.6g}'))}  ",
+                          html.Span(f"{pnl[1]:+.1f}%", style={
+                              "color": C["green"] if pnl[1] >= 0 else C["red"], "fontWeight": "bold"})],
+                         style={"fontFamily": MONO})] if pnl else []),
             html.Span([_lv_post_link(first, "első poszt"),
                        (f" · {len(g)}× említve, utoljára {_lv_days_ago(last.get('posted_at'))}"
                         if len(g) > 1 else "")], style={"color": C["dim"], "fontSize": "0.72rem"}),
@@ -1587,10 +1747,23 @@ def joao_levels_section(rows):
     head = html.Div(f"{len(rows)} szint · {len(posts)} poszt · {dates[0]} – {dates[-1]}", style={
         "color": C["dim"], "fontSize": "0.72rem", "marginTop": "6px"})
     children = [head]
+    btc_rows = [r for r in rows if r.get("asset") == "BTC"]
+    candles = _lv_candles()
+    grades = {_lv_key(r): joao_grading.grade_level(r, candles) for r in btc_rows}
+    chart = _lv_chart(btc_rows, grades, candles)
+    if chart is not None:
+        na = sum(1 for g in grades.values() if g and g["state"] == "na")
+        children.append(chart)
+        children.append(html.Div(
+            "Szakasz = poszt napja → áttörés napja / ma (napi záró alapján; a fitil nem töri át). "
+            f"Nem értékelhető (poszt napján már átlépve): {na}.",
+            style={"color": C["dim"], "fontSize": "0.7rem", "marginTop": "4px"}))
     own = _lv_own_positions(rows)
     if own:
         children.append(html.Div("Saját pozíciói", style={**_SECTION_H, "marginTop": "14px",
                                                            "fontSize": "0.85rem"}))
+        children.append(html.Div("Eredmény a mostani árfolyammal, tőkeáttétel nélkül; a pozíció zárásáról nincs adat.",
+                                 style={"color": C["dim"], "fontSize": "0.7rem", "marginTop": "2px"}))
         children.append(html.Div(own, style={"marginTop": "4px"}))
     by_asset = {}
     for r in visible:
@@ -1618,7 +1791,7 @@ def joao_levels_section(rows):
                             **{"data-ts": g[0].get("posted_at") or ""}, children=[
                 html.Span(_lv_post_link(g[0], _local_stamp(g[0].get("posted_at"))),
                           style={"fontFamily": MONO, "fontSize": "0.72rem", "marginRight": "10px"}),
-                *[_lv_chip(r) for r in g if only is None or only(r)]])
+                *[_lv_chip(r, grades.get(_lv_key(r))) for r in g if only is None or only(r)]])
 
         lines = [post_line(g, lambda r: not is_aux(r)) for g in main_posts[:_LV_MAX_POSTS]]
         if len(main_posts) > _LV_MAX_POSTS:
@@ -2688,7 +2861,9 @@ def _warm_all():
     except Exception:
         kndr_syms = set()
     try:
-        warm_prices(kndr_syms | {"BTC-USD"}, max_age=WARM_MAX_AGE)
+        own_syms = {_yf_symbol(r["asset"], "crypto") for r in load_joao_levels()
+                    if r.get("kind") == "own_entry"}
+        warm_prices(kndr_syms | {"BTC-USD"} | own_syms, max_age=WARM_MAX_AGE)
     except Exception:
         pass
     for sym in kndr_syms:
@@ -2696,6 +2871,10 @@ def _warm_all():
             get_ohlc(sym, KNDR_HISTORY_START, max_age=WARM_MAX_AGE)
         except Exception:
             pass
+    try:
+        get_ohlc("BTC-USD", JOAO_LEVELS_START, max_age=WARM_MAX_AGE)     # Joao szintek chart + grading
+    except Exception:
+        pass
     _warm_state["done"] = time.time()
 
 

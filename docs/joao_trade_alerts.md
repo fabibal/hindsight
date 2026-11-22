@@ -24,6 +24,16 @@ Inside the existing daily `twitter_digest.py` run (no extra X fetch):
    (a 7-asset post is one message). Delivery is at-least-once: a lost HTTP reply
    after a successful send can duplicate one message.
 
+## Position cards in images (2026-11-21)
+The event call also receives the post's images (large, up to 4). A Binance/Hyperliquid
+position card in his post counts as his own position (`source: "image"`, usually `existing`).
+An image event is accepted only if the independent level read (`joao_levels`, own call and
+schema) found the same own entry (same asset and side, price within 0.5%); the message then
+carries the level's exact price. If they disagree the levels are re-read up to twice
+(`twitter_digest.LEVEL_RECHECKS`); still no agreement = no alert (kept in
+`trade_events_rejected`). Replay on the known card posts: 10-08 post 8/8 entries, 6 negative
+controls (heatmaps, ETF charts) 0 events.
+
 ## Files
 - `trade_alerts.py` - schema, decision rules, state, dispatch, CLI
 - `telegram_notifications.py` - stdlib sender; reads credentials from the
